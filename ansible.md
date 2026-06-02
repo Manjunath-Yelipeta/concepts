@@ -137,6 +137,260 @@ Key rule: **indentation matters** — use spaces, never tabs.
 
 ---
 
+## Variables
+
+Variables let you avoid hardcoding values. You reference them with `{{ variable_name }}`.
+
+### Play-level vars
+
+Defined in the playbook itself, available to all tasks in that play.
+
+```yaml
+- name: demo
+  hosts: localhost
+  connection: local
+  vars:
+    COURSE: "Ansible"
+    TRAINER: "sivakumar"
+    DURATION: "150HRS"
+  tasks:
+  - debug:
+      msg: "Learning {{ COURSE }} with {{ TRAINER }} for {{ DURATION }}"
+```
+
+### Task-level vars
+
+Defined inside a specific task — overrides play-level vars for that task only.
+
+```yaml
+  tasks:
+  - name: print info
+    vars:
+      COURSE: "DevSecOps with AIOps"  # overrides play-level COURSE
+    debug:
+      msg: "Learning {{ COURSE }}"
+```
+
+### vars_files
+
+Keep variables in a separate YAML file and load it in the playbook. Cleaner for large configs.
+
+```yaml
+# course.yaml
+COURSE: Ansible
+TRAINER: sivakumar
+DURATION: 10HRS
+```
+
+```yaml
+- name: demo
+  hosts: local
+  connection: local
+  vars_files:
+  - course.yaml
+  tasks:
+  - debug:
+      msg: "{{ COURSE }} by {{ TRAINER }}"
+```
+
+### vars_prompt
+
+Ask the user for input at runtime (like `read` in shell).
+
+```yaml
+  vars_prompt:
+  - name: username
+    prompt: "Please enter username"
+    private: false       # shows input as you type
+
+  - name: password
+    prompt: "Please enter password"
+    private: true        # hides input
+```
+
+### group_vars
+
+Variables scoped to an inventory group. Ansible auto-loads files from a `group_vars/` folder next to your playbook.
+
+```
+group_vars/
+  all.yaml        # applies to every host
+  frontend.yaml   # applies only to [frontend] group
+```
+
+```yaml
+# group_vars/frontend.yaml
+COURSE: "Ansible from group_vars"
+TRAINER: "Sivakumar"
+```
+
+### Command-line vars (-e)
+
+Pass variables at runtime — highest priority, overrides everything.
+
+```bash
+ansible-playbook 09-vars.yaml -e name=Sivakumar
+```
+
+```yaml
+  tasks:
+  - name: print name
+    debug:
+      msg: "Hello {{ name }}"
+```
+
+### Variable Preference Order (highest → lowest)
+
+When the same variable is defined in multiple places, this is the winner:
+
+```
+1. Command-line args  (-e)
+2. Task level         (vars: inside a task)
+3. vars_files
+4. vars_prompt
+5. Play level         (vars: at play level)
+6. Inventory / group_vars
+```
+
+---
+
+## Data Types
+
+```yaml
+  vars:
+    course: "DevSecOps with AIOps"   # string
+    duration_in_hrs: 150             # number (int)
+    is_live_sessions: true           # boolean
+    topics:                          # list
+    - linux
+    - shell
+    - ansible
+    more_details:                    # map (key-value pairs)
+      months: 5
+      trainer: "Sivakumar Reddy"
+```
+
+Access map values: `{{ more_details.trainer }}`  
+Access list values: `{{ topics[0] }}`
+
+---
+
+## Conditions
+
+Use `when:` to run a task only if a condition is true. No brackets needed — it's a Jinja2 expression.
+
+```yaml
+  vars:
+    live_sessions: 4
+  tasks:
+  - name: more than 5 sessions?
+    debug:
+      msg: "Yes, Ansible took more than 5 sessions"
+    when: live_sessions > 5
+```
+
+Even / odd check:
+
+```yaml
+  vars:
+    given_number: 7
+  tasks:
+  - name: is even
+    debug:
+      msg: "{{ given_number }} is even"
+    when: given_number % 2 == 0
+
+  - name: is odd
+    debug:
+      msg: "{{ given_number }} is odd"
+    when: given_number % 2 != 0
+```
+
+---
+
+## ansible_facts
+
+Ansible automatically collects info about the target server before running tasks — OS, IP, architecture, memory, etc. This is stored in `ansible_facts`.
+
+```yaml
+  tasks:
+  - name: print all facts
+    debug:
+      msg: "{{ ansible_facts }}"
+```
+
+Useful for writing playbooks that work on both RedHat and Debian servers:
+
+```yaml
+  tasks:
+  - name: RedHat family
+    debug:
+      msg: "Package manager is dnf"
+    when: ansible_facts.os_family == "RedHat"
+
+  - name: Debian family
+    debug:
+      msg: "Package manager is apt-get"
+    when: ansible_facts.os_family == "Debian"
+```
+
+`ansible_facts` is a **reserved special variable** — Ansible fills it automatically, you just use it.
+
+---
+
+## Loops
+
+When you need to do the same thing for multiple items, use `loop:`. The current item is always available as `{{ item }}`.
+
+### Simple list
+
+```yaml
+  tasks:
+  - name: greet everyone
+    debug:
+      msg: "Hi {{ item }}"
+    loop:
+    - Ramesh
+    - Raheem
+    - John
+```
+
+### Install multiple packages
+
+```yaml
+- name: install packages
+  hosts: frontend
+  become: yes        # run as sudo
+  tasks:
+  - name: install packages
+    package:
+      name: "{{ item }}"
+      state: present
+    loop:
+    - nginx
+    - mysql
+    - mongodb-mongosh
+    - git
+```
+
+### Loop with maps — different state per item
+
+When each item needs its own properties, use inline maps with `item.key`:
+
+```yaml
+  tasks:
+  - name: manage packages
+    package:
+      name: "{{ item.name }}"
+      state: "{{ item.state }}"
+    loop:
+    - { name: "nginx", state: "present" }   # install
+    - { name: "mysql", state: "absent" }    # remove
+    - { name: "zip",   state: "present" }   # install
+```
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -148,3 +402,12 @@ Key rule: **indentation matters** — use spaces, never tabs.
 | Ad-hoc command | One-off Ansible task run from the terminal |
 | Playbook | YAML file with a list of tasks to run on target servers |
 | Module | Pre-built unit of work in Ansible (`ping`, `dnf`, `copy`, etc.) |
+| `vars` | Define variables at play or task level |
+| `vars_files` | Load variables from an external YAML file |
+| `vars_prompt` | Prompt user for variable input at runtime |
+| `group_vars/` | Auto-loaded variables scoped to an inventory group |
+| `-e` | Command-line variable — highest priority |
+| `when:` | Run a task conditionally |
+| `ansible_facts` | Auto-collected system info (OS, IP, arch, etc.) |
+| `loop:` | Repeat a task over a list; current item is `{{ item }}` |
+| `become: yes` | Run task with sudo / privilege escalation |
