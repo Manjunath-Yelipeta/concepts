@@ -4,12 +4,40 @@
 
 When you provision infrastructure manually — clicking through the AWS console, running CLI commands — it doesn't scale. You can't version it, reproduce it, or hand it to a teammate and get the same result.
 
-**Terraform** is an Infrastructure as Code (IaC) tool. You describe what infrastructure you want in code, and Terraform creates, updates, or destroys it to match that description.
+**Terraform** is an Infrastructure as Code (IaC) tool — IaC means you describe what infrastructure you want in code files, and Terraform creates, updates, or destroys it to match. The same benefits that code gives you over manual work apply directly here.
 
 > In Ansible: you describe how to configure servers.  
 > In Terraform: you describe what infrastructure should exist.
 
 Terraform works with dozens of platforms — AWS, Azure, GCP, Kubernetes — through **providers**.
+
+---
+
+## Why IaC? Why Terraform?
+
+**1. Version control your infrastructure**
+
+Your `.tf` files live in git. You get the full history of every change — who changed what, when, and why. You can review infrastructure changes in a PR just like application code, and roll back if something goes wrong.
+
+**2. Consistent environments**
+
+The same Terraform code that creates your DEV environment creates UAT and PROD. No more "it works in dev but not prod" caused by someone clicking through the console differently. Every environment is a known, reproducible state.
+
+**3. Cost optimisation**
+
+Because spinning up and tearing down is just `terraform apply` and `terraform destroy`, you only pay for what you actually need. Spin up a full environment for testing, destroy it when the test is done. No forgotten instances running over the weekend.
+
+**4. Reusable infrastructure — Modules**
+
+Terraform lets you package infrastructure into **modules** — reusable units you can call with different inputs. Write the VPC setup once, use it across five projects by just changing the variables. Same idea as functions in programming.
+
+**5. Inventory management (CRUD)**
+
+Terraform's state file (`terraform.tfstate`) is a live inventory of everything it manages — what exists, its attributes, its relationships. You always know exactly what's out there. No more spreadsheets or tribal knowledge about what's running where.
+
+**6. Dependency management**
+
+Terraform figures out the order to create resources automatically. If an EC2 instance needs a security group, Terraform creates the security group first — you don't have to think about it. Reference one resource from another (`aws_security_group.name.id`) and Terraform builds the dependency graph for you.
 
 ---
 
