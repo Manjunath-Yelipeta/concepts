@@ -147,6 +147,40 @@ Terraform stores what it created in `terraform.tfstate`. Never delete this file 
 
 ---
 
+## State
+
+Terraform's job is to keep **actual infrastructure** matching **desired infrastructure**. The state file is how it tracks what it has created — think of it as Terraform's memory.
+
+```
+.tf files       → desired/declared infrastructure
+state file      → what Terraform created (its memory)
+inside provider → actual infrastructure (what really exists)
+```
+
+**How state works across different situations:**
+
+| Situation | State file | Actual infra | What Terraform does |
+|-----------|-----------|-------------|-------------------|
+| First time (`terraform apply`) | doesn't exist | doesn't exist | creates everything, writes state |
+| No changes | matches actual | matches `.tf` files | nothing to do |
+| `.tf` files changed | matches actual | differs from `.tf` | updates to match `.tf` |
+| Someone changed infra outside Terraform | doesn't match actual | — | detects drift, plans to fix it |
+| Resource manually deleted | says it exists | doesn't exist | recreates it |
+
+**In a team environment:**
+
+The state file must be stored remotely (e.g. S3) so everyone on the team shares the same state. If each developer has their own local state file, Terraform won't know what others have created — you'll end up with duplicate resources or conflicting changes.
+
+The remote state should also be **locked** — so two people can't run `terraform apply` at the same time and corrupt the state.
+
+**State file security rules:**
+- Terraform owns the state file completely — never edit it manually
+- Don't give developers permission to delete the state file
+- Enable versioning on the S3 bucket (so you can recover old state)
+- Enable replication as backup
+
+---
+
 ## Variables
 
 Variables make your code DRY — replace hardcoded values with names you can change from outside.
@@ -227,6 +261,69 @@ instance_type = "t3.medium"
 ```
 
 Anything in this file overrides `default` but loses to CLI `-var`.
+
+---
+
+## locals
+
+`locals` are like variables but with extra capabilities:
+
+- You can use other variables inside a local (`var.x`)
+- You can use other locals inside a local
+- You can assign expressions and functions to them and reuse the result
+- You cannot override them from outside (unlike variables) — they are internal to the config
+
+```hcl
+# locals.tf
+locals {
+  name         = "${var.project}-${var.environment}"   # "roboshop-dev"
+  instance_type = "t3.micro"
+  ami_id        = data.aws_ami.joindevops.id           # pulled from data source
+
+  common_tags = {
+    Name        = "${var.project}-${var.environment}"
+    Environment = var.environment
+    Project     = var.project
+  }
+
+  ec2_tags = merge(
+    local.common_tags,                                 # local inside local
+    { Name = "${local.name}-locals-demo" }             # → "roboshop-dev-locals-demo"
+  )
+
+  sg_tags = merge(
+    local.common_tags,
+    { Name = "${local.name}-common" }                  # → "roboshop-dev-common"
+  )
+}
+```
+
+```hcl
+# main.tf — everything comes from locals, nothing hardcoded
+resource "aws_instance" "terraform_demo" {
+  ami                    = local.ami_id
+  instance_type          = local.instance_type
+  vpc_security_group_ids = [aws_security_group.allow_terraform.id]
+  tags                   = local.ec2_tags
+}
+
+resource "aws_security_group" "allow_terraform" {
+  name = "${local.name}-common"
+  tags = local.sg_tags
+}
+```
+
+Notice `local.ec2_tags` uses `local.common_tags` inside it — locals can reference other locals. This is something variables cannot do.
+
+**When to use locals vs variables:**
+
+| | `variable` | `local` |
+|---|---|---|
+| Set from outside | Yes (CLI, tfvars, env) | No — fixed in code |
+| Can use expressions/functions | No | Yes |
+| Can reference other vars/locals | No | Yes |
+| Can reference data sources | No | Yes |
+| Use for | inputs from the user | computed intermediate values |
 
 ---
 
@@ -339,6 +436,55 @@ vpc_security_group_ids = [
 | Resource address | `aws_instance.x[0]` | `aws_instance.x["mongodb"]` |
 | Remove middle item | renumbers everything below it | only removes that one key |
 
+### dynamic block
+
+`for_each` on a resource creates multiple resources. `dynamic` is different — it creates multiple **blocks inside** a single resource. The most common use is generating multiple `ingress` rules in a security group without repeating the block.
+
+```hcl
+variable "ingress_rules" {
+  default = {
+    ssh = {
+      port        = 22
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+    http = {
+      port        = 80
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+    mysql = {
+      port        = 3306
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+}
+```
+
+```hcl
+resource "aws_security_group" "allow_terraform" {
+  name = "allow_terraform_dynamic"
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  dynamic "ingress" {
+    for_each = var.ingress_rules
+    content {
+      from_port   = ingress.value.port
+      to_port     = ingress.value.port
+      protocol    = "tcp"
+      cidr_blocks = ingress.value.cidr_blocks
+    }
+  }
+}
+```
+
+- The label after `dynamic` (`"ingress"`) becomes the special variable inside `content {}` — use `ingress.value` and `ingress.key`
+- `content {}` is the template — one copy is generated per map entry
+- Adding a new rule only requires adding an entry to `var.ingress_rules`, no new block in the resource
 
 ---
 
@@ -492,6 +638,129 @@ Without this, step 3 runs first and fails because the instance still holds a ref
 
 ---
 
+## Data Sources
+
+`resource` blocks create things. `data` blocks **read** existing things from the provider without creating or managing them.
+
+Use a data source when something already exists and you just need its information — for example, fetching the latest AMI ID instead of hardcoding it, or reading a VPC that was created outside of Terraform.
+
+```hcl
+# data.tf
+data "aws_ami" "joindevops" {
+  most_recent = true
+  owners      = ["973714476881"]   # joindevops AWS account
+
+  filter {
+    name   = "name"
+    values = ["Redhat-9-DevOps-Practice"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+}
+
+output "ami_id" {
+  value = data.aws_ami.joindevops.id
+}
+```
+
+```hcl
+# main.tf — use the fetched AMI instead of hardcoding
+resource "aws_instance" "terraform_demo" {
+  ami           = data.aws_ami.joindevops.id
+  instance_type = "t3.micro"
+}
+```
+
+Reference a data source with `data.<type>.<name>.<attribute>` — same pattern as resources but prefixed with `data.`.
+
+Multiple `filter` blocks narrow the result down. `most_recent = true` picks the latest match when there are multiple AMIs.
+
+---
+
+## Provisioners
+
+Provisioners run scripts or commands at the time a resource is created or destroyed. They are a last resort — if there is a Terraform resource or an Ansible playbook that can do the job, use that instead.
+
+There are three types:
+
+You can attach multiple provisioners to a single resource. By default they run on **create**. Use `when = destroy` to run one on **destroy** instead.
+
+```hcl
+resource "aws_instance" "terraform_demo" {
+  ami                    = "ami-0220d79f3f480ecf5"
+  instance_type          = "t3.micro"
+  vpc_security_group_ids = [aws_security_group.allow_terraform.id]
+
+  # runs on create — write private IP into inventory
+  provisioner "local-exec" {
+    command = "echo ${self.private_ip} > inventory.ini"
+  }
+
+  provisioner "local-exec" {
+    command = "echo instance created"
+  }
+
+  # runs on destroy — clear the inventory file
+  provisioner "local-exec" {
+    when    = destroy
+    command = "echo instance is going to be destroyed"
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "echo > inventory.ini"
+  }
+
+  # SSH connection block — required for remote-exec
+  connection {
+    type     = "ssh"
+    user     = "ec2-user"
+    password = "DevOps321"
+    host     = self.public_ip
+  }
+
+  # runs on create — install nginx inside the server
+  provisioner "remote-exec" {
+    inline = [
+      "sudo dnf install nginx -y",
+    ]
+  }
+}
+```
+
+`self` refers to the resource being created/destroyed — `self.private_ip`, `self.public_ip`, etc.
+
+**`file`** — copies a file from your local machine into the server (requires a `connection` block):
+
+```hcl
+  provisioner "file" {
+    source      = "config/app.conf"
+    destination = "/etc/app/app.conf"
+  }
+```
+
+**On-create vs on-destroy summary:**
+
+| | Default | `when = destroy` |
+|---|---|---|
+| Runs when | `terraform apply` (resource created) | `terraform destroy` (resource deleted) |
+| Use for | write inventory, trigger Ansible, notify | clean up inventory, deregister from load balancer |
+
+---
+
 ## Real-World Example: Roboshop — EC2 + SG + Route53
 
 All 10 roboshop components, each with its own EC2 instance, its own security group, a private DNS record, and a public DNS record for just the frontend.
@@ -639,8 +908,20 @@ What this creates: 10 EC2 instances + 10 per-component SGs + 1 common SG + 10 pr
 | `count.index` | Zero-based index of the current copy |
 | `for_each` | Create one resource per map entry; tracks by key name — safer than count |
 | `each.key` / `each.value` | Current map key and value inside a for_each resource |
+| `dynamic` | Generate repeated nested blocks inside a resource (e.g. multiple ingress rules) |
+| `content {}` | Template block inside `dynamic` — one copy generated per iteration |
 | String interpolation | `"${var.project}-${var.environment}"` — embed expressions in strings |
 | Resource reference | `aws_security_group.name.id` — use another resource's attribute |
+| `locals` | Internal computed values — can use vars, other locals, and functions; not overridable from outside |
+| `local.name` | How you reference a local value |
+| State file | Terraform's memory — records what it created; never edit manually |
+| Remote state | Store state in S3 so the whole team shares it; lock it to prevent concurrent applies |
+| `data` block | Read existing infrastructure from the provider without creating it |
+| `data.<type>.<name>.<attr>` | How you reference a data source attribute |
+| `local-exec` provisioner | Run a command on the machine running Terraform |
+| `remote-exec` provisioner | Run commands inside the newly created server over SSH |
+| `file` provisioner | Copy a file from local machine into the server |
+| `self` | Inside a provisioner, refers to the resource being created |
 | `output` | Print a value after apply; expose values from modules |
 | `contains(list, val)` | Check if an element exists in a list — true/false |
 | `index(list, val)` | Find the position of an element in a list |
