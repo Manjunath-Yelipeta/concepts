@@ -230,69 +230,6 @@ Anything in this file overrides `default` but loses to CLI `-var`.
 
 ---
 
-## locals
-
-`locals` are like variables but with extra capabilities:
-
-- You can use other variables inside a local (`var.x`)
-- You can use other locals inside a local
-- You can assign expressions and functions to them and reuse the result
-- You cannot override them from outside (unlike variables) — they are internal to the config
-
-```hcl
-# locals.tf
-locals {
-  name         = "${var.project}-${var.environment}"   # "roboshop-dev"
-  instance_type = "t3.micro"
-  ami_id        = data.aws_ami.joindevops.id           # pulled from data source
-
-  common_tags = {
-    Name        = "${var.project}-${var.environment}"
-    Environment = var.environment
-    Project     = var.project
-  }
-
-  ec2_tags = merge(
-    local.common_tags,                                 # local inside local
-    { Name = "${local.name}-locals-demo" }             # → "roboshop-dev-locals-demo"
-  )
-
-  sg_tags = merge(
-    local.common_tags,
-    { Name = "${local.name}-common" }                  # → "roboshop-dev-common"
-  )
-}
-```
-
-```hcl
-# main.tf — everything comes from locals, nothing hardcoded
-resource "aws_instance" "terraform_demo" {
-  ami                    = local.ami_id
-  instance_type          = local.instance_type
-  vpc_security_group_ids = [aws_security_group.allow_terraform.id]
-  tags                   = local.ec2_tags
-}
-
-resource "aws_security_group" "allow_terraform" {
-  name = "${local.name}-common"
-  tags = local.sg_tags
-}
-```
-
-Notice `local.ec2_tags` uses `local.common_tags` inside it — locals can reference other locals. This is something variables cannot do.
-
-**When to use locals vs variables:**
-
-| | `variable` | `local` |
-|---|---|---|
-| Set from outside | Yes (CLI, tfvars, env) | No — fixed in code |
-| Can use expressions/functions | No | Yes |
-| Can reference other vars/locals | No | Yes |
-| Can reference data sources | No | Yes |
-| Use for | inputs from the user | computed intermediate values |
-
----
-
 ## Conditions (Ternary)
 
 No `if/else` blocks in Terraform — use the ternary expression:
@@ -401,58 +338,6 @@ vpc_security_group_ids = [
 | Current item | `count.index` (number) | `each.key` / `each.value` |
 | Resource address | `aws_instance.x[0]` | `aws_instance.x["mongodb"]` |
 | Remove middle item | renumbers everything below it | only removes that one key |
-
-### dynamic block
-
-`for_each` on a resource creates multiple resources. `dynamic` is different — it creates multiple **blocks inside** a single resource. The most common use is generating multiple `ingress` rules in a security group without repeating the block.
-
-```hcl
-variable "ingress_rules" {
-  default = {
-    ssh = {
-      port        = 22
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-    http = {
-      port        = 80
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-    mysql = {
-      port        = 3306
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  }
-}
-```
-
-```hcl
-resource "aws_security_group" "allow_terraform" {
-  name = "allow_terraform_dynamic"
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  dynamic "ingress" {
-    for_each = var.ingress_rules
-    content {
-      from_port   = ingress.value.port
-      to_port     = ingress.value.port
-      protocol    = "tcp"
-      cidr_blocks = ingress.value.cidr_blocks
-    }
-  }
-}
-```
-
-- The label after `dynamic` (`"ingress"`) becomes the special variable inside `content {}` — use `ingress.value` and `ingress.key`
-- `content {}` is the template — one copy is generated per map entry
-- Adding a new rule only requires adding an entry to `var.ingress_rules`, no new block in the resource
-
----
 
 ## String Interpolation
 
@@ -724,6 +609,91 @@ resource "aws_instance" "terraform_demo" {
 |---|---|---|
 | Runs when | `terraform apply` (resource created) | `terraform destroy` (resource deleted) |
 | Use for | write inventory, trigger Ansible, notify | clean up inventory, deregister from load balancer |
+
+---
+
+## State
+
+Terraform's job is to keep **actual infrastructure** matching **desired infrastructure**. The state file is how it tracks what it has created — think of it as Terraform's memory.
+
+```
+.tf files       → desired/declared infrastructure
+state file      → what Terraform created (its memory)
+inside provider → actual infrastructure (what really exists)
+```
+
+**How state works across different situations:**
+
+| Situation | State file | Actual infra | What Terraform does |
+|-----------|-----------|-------------|-------------------|
+| First time (`terraform apply`) | doesn't exist | doesn't exist | creates everything, writes state |
+| No changes | matches actual | matches `.tf` files | nothing to do |
+| `.tf` files changed | matches actual | differs from `.tf` | updates to match `.tf` |
+| Someone changed infra outside Terraform | doesn't match actual | — | detects drift, plans to fix it |
+| Resource manually deleted | says it exists | doesn't exist | recreates it |
+
+**Seeing state in action:**
+
+Apply this config — Terraform creates the instance and writes the state file:
+
+```hcl
+resource "aws_instance" "terraform_demo" {
+  ami           = data.aws_ami.joindevops.id
+  instance_type = "t3.micro"
+  tags = {
+    Name = "terraform-demo-1"
+  }
+}
+```
+
+Now change the `Name` tag and run `terraform plan`:
+
+```hcl
+    Name = "terraform-demo-1-change"
+```
+
+Terraform compares the state file (says `Name = "terraform-demo-1"`) against your `.tf` files (says `"terraform-demo-1-change"`) and shows:
+
+```
+~ aws_instance.terraform_demo
+  ~ tags = {
+      ~ Name = "terraform-demo-1" -> "terraform-demo-1-change"
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+It knows exactly what changed — because the state file is its memory of what it last created.
+
+**Remote state — storing state in S3:**
+
+In a team, everyone must share the same state file. Store it in S3 and use DynamoDB for locking so two people can't apply at the same time:
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+
+  backend "s3" {
+    bucket         = "my-terraform-state-bucket"
+    key            = "roboshop/dev/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-state-lock"
+  }
+}
+```
+
+Once configured, `terraform init` migrates the local state to S3. From that point everyone on the team runs against the same state.
+
+**State file security rules:**
+- Terraform owns the state file completely — never edit it manually
+- Don't give developers permission to delete the state file
+- Enable versioning on the S3 bucket (so you can recover old state)
+- Enable replication as backup
 
 ---
 
