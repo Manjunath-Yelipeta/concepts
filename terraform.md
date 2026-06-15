@@ -489,6 +489,58 @@ Without this, step 3 runs first and fails because the instance still holds a ref
 
 ---
 
+## Dynamic Block
+
+`for_each` on a resource creates multiple resources. `dynamic` is different — it creates multiple **blocks inside** a single resource. The most common use is generating multiple `ingress` rules in a security group without repeating the block.
+
+```hcl
+variable "ingress_rules" {
+  default = {
+    ssh = {
+      port        = 22
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+    http = {
+      port        = 80
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+    mysql = {
+      port        = 3306
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+}
+```
+
+```hcl
+resource "aws_security_group" "allow_terraform" {
+  name = "allow_terraform_dynamic"
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  dynamic "ingress" {
+    for_each = var.ingress_rules
+    content {
+      from_port   = ingress.value.port
+      to_port     = ingress.value.port
+      protocol    = "tcp"
+      cidr_blocks = ingress.value.cidr_blocks
+    }
+  }
+}
+```
+
+- The label after `dynamic` (`"ingress"`) becomes the special variable inside `content {}` — use `ingress.value` and `ingress.key`
+- `content {}` is the template — one copy is generated per map entry
+- Adding a new rule only requires adding an entry to `var.ingress_rules`, no new block in the resource
+
+---
+
 ## Data Sources
 
 `resource` blocks create things. `data` blocks **read** existing things from the provider without creating or managing them.
@@ -538,77 +590,6 @@ resource "aws_instance" "terraform_demo" {
 Reference a data source with `data.<type>.<name>.<attribute>` — same pattern as resources but prefixed with `data.`.
 
 Multiple `filter` blocks narrow the result down. `most_recent = true` picks the latest match when there are multiple AMIs.
-
----
-
-## Provisioners
-
-Provisioners run scripts or commands at the time a resource is created or destroyed. They are a last resort — if there is a Terraform resource or an Ansible playbook that can do the job, use that instead.
-
-There are three types:
-
-You can attach multiple provisioners to a single resource. By default they run on **create**. Use `when = destroy` to run one on **destroy** instead.
-
-```hcl
-resource "aws_instance" "terraform_demo" {
-  ami                    = "ami-0220d79f3f480ecf5"
-  instance_type          = "t3.micro"
-  vpc_security_group_ids = [aws_security_group.allow_terraform.id]
-
-  # runs on create — write private IP into inventory
-  provisioner "local-exec" {
-    command = "echo ${self.private_ip} > inventory.ini"
-  }
-
-  provisioner "local-exec" {
-    command = "echo instance created"
-  }
-
-  # runs on destroy — clear the inventory file
-  provisioner "local-exec" {
-    when    = destroy
-    command = "echo instance is going to be destroyed"
-  }
-
-  provisioner "local-exec" {
-    when    = destroy
-    command = "echo > inventory.ini"
-  }
-
-  # SSH connection block — required for remote-exec
-  connection {
-    type     = "ssh"
-    user     = "ec2-user"
-    password = "DevOps321"
-    host     = self.public_ip
-  }
-
-  # runs on create — install nginx inside the server
-  provisioner "remote-exec" {
-    inline = [
-      "sudo dnf install nginx -y",
-    ]
-  }
-}
-```
-
-`self` refers to the resource being created/destroyed — `self.private_ip`, `self.public_ip`, etc.
-
-**`file`** — copies a file from your local machine into the server (requires a `connection` block):
-
-```hcl
-  provisioner "file" {
-    source      = "config/app.conf"
-    destination = "/etc/app/app.conf"
-  }
-```
-
-**On-create vs on-destroy summary:**
-
-| | Default | `when = destroy` |
-|---|---|---|
-| Runs when | `terraform apply` (resource created) | `terraform destroy` (resource deleted) |
-| Use for | write inventory, trigger Ansible, notify | clean up inventory, deregister from load balancer |
 
 ---
 
@@ -694,6 +675,138 @@ Once configured, `terraform init` migrates the local state to S3. From that poin
 - Don't give developers permission to delete the state file
 - Enable versioning on the S3 bucket (so you can recover old state)
 - Enable replication as backup
+
+---
+
+## locals
+
+`locals` are like variables but with extra capabilities:
+
+- You can use other variables inside a local (`var.x`)
+- You can use other locals inside a local
+- You can assign expressions and functions to them and reuse the result
+- You cannot override them from outside (unlike variables) — they are internal to the config
+
+```hcl
+# locals.tf
+locals {
+  name          = "${var.project}-${var.environment}"   # "roboshop-dev"
+  instance_type = "t3.micro"
+  ami_id        = data.aws_ami.joindevops.id            # pulled from data source
+
+  common_tags = {
+    Name        = "${var.project}-${var.environment}"
+    Environment = var.environment
+    Project     = var.project
+  }
+
+  ec2_tags = merge(
+    local.common_tags,                                  # local inside local
+    { Name = "${local.name}-locals-demo" }              # → "roboshop-dev-locals-demo"
+  )
+
+  sg_tags = merge(
+    local.common_tags,
+    { Name = "${local.name}-common" }                   # → "roboshop-dev-common"
+  )
+}
+```
+
+```hcl
+# main.tf — everything comes from locals, nothing hardcoded
+resource "aws_instance" "terraform_demo" {
+  ami                    = local.ami_id
+  instance_type          = local.instance_type
+  vpc_security_group_ids = [aws_security_group.allow_terraform.id]
+  tags                   = local.ec2_tags
+}
+
+resource "aws_security_group" "allow_terraform" {
+  name = "${local.name}-common"
+  tags = local.sg_tags
+}
+```
+
+Notice `local.ec2_tags` uses `local.common_tags` inside it — locals can reference other locals. This is something variables cannot do.
+
+**When to use locals vs variables:**
+
+| | `variable` | `local` |
+|---|---|---|
+| Set from outside | Yes (CLI, tfvars, env) | No — fixed in code |
+| Can use expressions/functions | No | Yes |
+| Can reference other vars/locals | No | Yes |
+| Can reference data sources | No | Yes |
+| Use for | inputs from the user | computed intermediate values |
+
+---
+
+## Provisioners
+
+Provisioners run scripts or commands at the time a resource is created or destroyed. They are a last resort — if there is a Terraform resource or an Ansible playbook that can do the job, use that instead.
+
+You can attach multiple provisioners to a single resource. By default they run on **create**. Use `when = destroy` to run one on **destroy** instead.
+
+```hcl
+resource "aws_instance" "terraform_demo" {
+  ami                    = "ami-0220d79f3f480ecf5"
+  instance_type          = "t3.micro"
+  vpc_security_group_ids = [aws_security_group.allow_terraform.id]
+
+  # runs on create — write private IP into inventory
+  provisioner "local-exec" {
+    command = "echo ${self.private_ip} > inventory.ini"
+  }
+
+  provisioner "local-exec" {
+    command = "echo instance created"
+  }
+
+  # runs on destroy — clear the inventory file
+  provisioner "local-exec" {
+    when    = destroy
+    command = "echo instance is going to be destroyed"
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "echo > inventory.ini"
+  }
+
+  # SSH connection block — required for remote-exec
+  connection {
+    type     = "ssh"
+    user     = "ec2-user"
+    password = "DevOps321"
+    host     = self.public_ip
+  }
+
+  # runs on create — install nginx inside the server
+  provisioner "remote-exec" {
+    inline = [
+      "sudo dnf install nginx -y",
+    ]
+  }
+}
+```
+
+`self` refers to the resource being created/destroyed — `self.private_ip`, `self.public_ip`, etc.
+
+**`file`** — copies a file from your local machine into the server (requires a `connection` block):
+
+```hcl
+  provisioner "file" {
+    source      = "config/app.conf"
+    destination = "/etc/app/app.conf"
+  }
+```
+
+**On-create vs on-destroy summary:**
+
+| | Default | `when = destroy` |
+|---|---|---|
+| Runs when | `terraform apply` (resource created) | `terraform destroy` (resource deleted) |
+| Use for | write inventory, trigger Ansible, notify | clean up inventory, deregister from load balancer |
 
 ---
 
