@@ -167,11 +167,63 @@ inside provider → actual infrastructure (what really exists)
 | Someone changed infra outside Terraform | doesn't match actual | — | detects drift, plans to fix it |
 | Resource manually deleted | says it exists | doesn't exist | recreates it |
 
-**In a team environment:**
+**Seeing state in action:**
 
-The state file must be stored remotely (e.g. S3) so everyone on the team shares the same state. If each developer has their own local state file, Terraform won't know what others have created — you'll end up with duplicate resources or conflicting changes.
+Apply this config — Terraform creates the instance and writes the state file:
 
-The remote state should also be **locked** — so two people can't run `terraform apply` at the same time and corrupt the state.
+```hcl
+resource "aws_instance" "terraform_demo" {
+  ami           = data.aws_ami.joindevops.id
+  instance_type = "t3.micro"
+  tags = {
+    Name = "terraform-demo-1"
+  }
+}
+```
+
+Now change the `Name` tag and run `terraform plan`:
+
+```hcl
+    Name = "terraform-demo-1-change"
+```
+
+Terraform compares the state file (says `Name = "terraform-demo-1"`) against your `.tf` files (says `"terraform-demo-1-change"`) and shows:
+
+```
+~ aws_instance.terraform_demo
+  ~ tags = {
+      ~ Name = "terraform-demo-1" -> "terraform-demo-1-change"
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+It knows exactly what changed — because the state file is its memory of what it last created.
+
+**Remote state — storing state in S3:**
+
+In a team, everyone must share the same state file. Store it in S3 and use DynamoDB for locking so two people can't apply at the same time:
+
+```hcl
+# provider.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+
+  backend "s3" {
+    bucket         = "my-terraform-state-bucket"
+    key            = "roboshop/dev/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-state-lock"
+  }
+}
+```
+
+Once configured, `terraform init` migrates the local state to S3. From that point everyone on the team runs against the same state.
 
 **State file security rules:**
 - Terraform owns the state file completely — never edit it manually
