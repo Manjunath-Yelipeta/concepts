@@ -660,10 +660,11 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "my-terraform-state-bucket"
-    key            = "roboshop/dev/terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "terraform-state-lock"
+    bucket       = "my-terraform-state-bucket"
+    key          = "roboshop/dev/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true   # native S3 locking — Terraform 1.10+, no DynamoDB needed
   }
 }
 ```
@@ -930,6 +931,433 @@ What this creates: 10 EC2 instances + 10 per-component SGs + 1 common SG + 10 pr
 
 ---
 
+## Naming Conventions
+
+Consistent naming prevents confusion across environments and teams. Four rules:
+
+1. **Don't repeat the resource type** in the name  
+   `roboshop-dev-cart` — good  
+   `roboshop-dev-cart-instance` — bad (the resource is already an EC2 instance, no need to say it)
+
+2. **Human-readable names use `-`, internal Terraform names use `_`**  
+   Tag `Name = "roboshop-dev-cart"` (hyphen)  
+   Resource label `aws_instance.roboshop_cart` (underscore)
+
+3. **Put tags at the end** of the resource block, not inline with other arguments
+
+4. **Plural name for plural resources, singular for single**  
+   `aws_subnet.public` (one) vs `var.public_subnet_cidrs` (list of many)
+
+**Resource name pattern used across projects:**
+
+```
+<project>-<environment>-<component>[-<az-suffix>]
+```
+
+Examples: `roboshop-dev-cart`, `roboshop-prod-public-1a`, `roboshop-dev-nat`
+
+---
+
+## Modules
+
+### Why modules?
+
+The same problem exists in Terraform that exists in any code — copy-pasting infrastructure leads to drift. If you fix a bug in the VPC setup for one project, you want it fixed everywhere. Modules solve this.
+
+| Analogy | Terraform equivalent |
+|---------|---------------------|
+| `common.sh` in shell scripting | module source file |
+| Ansible roles | Terraform modules |
+| Functions in Python | module calls in `.tf` |
+
+**Three reasons to write a module:**
+
+1. **Centralised standards** — enforce consistent tagging, naming, security defaults across all projects
+2. **Code reuse (DRY)** — write the VPC setup once, call it from every project
+3. **Easy maintenance** — fix a bug in the module, all callers pick it up when they upgrade
+
+### Module structure
+
+A module is just a directory of `.tf` files. Conventional layout:
+
+```
+terraform-aws-instance/
+├── main.tf        # resources
+├── variables.tf   # inputs (the module's API)
+├── outputs.tf     # outputs (what the caller can read back)
+├── locals.tf      # computed intermediate values
+└── data.tf        # data sources
+```
+
+### Writing a module — terraform-aws-instance
+
+This module wraps a single EC2 instance and always fetches the latest joindevops AMI automatically.
+
+```hcl
+# data.tf — always fetches the latest matching AMI; no hardcoded AMI ID
+data "aws_ami" "joindevops" {
+  most_recent = true
+  owners      = ["973714476881"]
+
+  filter { name = "name"              values = ["Redhat-9-DevOps-Practice"] }
+  filter { name = "root-device-type"  values = ["ebs"] }
+  filter { name = "virtualization-type" values = ["hvm"] }
+  filter { name = "architecture"      values = ["x86_64"] }
+}
+```
+
+```hcl
+# variables.tf
+variable "project"     { type = string }
+variable "environment" { type = string }
+variable "component"   { type = string }
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"
+
+  validation {
+    condition     = contains(["t3.micro", "t3.small", "t3.medium"], var.instance_type)
+    error_message = "Instance type must be t3.micro, t3.small, or t3.medium"
+  }
+}
+
+variable "sg_ids"    { type = list }
+variable "ec2_tags"  { type = map; default = {} }
+```
+
+```hcl
+# locals.tf
+locals {
+  ami_id = data.aws_ami.joindevops.id
+  common_tags = {
+    Project     = var.project
+    Environment = var.environment
+    Component   = var.component
+  }
+}
+```
+
+```hcl
+# main.tf
+resource "aws_instance" "main" {
+  ami                    = local.ami_id
+  instance_type          = var.instance_type
+  vpc_security_group_ids = var.sg_ids
+
+  tags = merge(
+    var.ec2_tags,
+    local.common_tags,
+    { Name = "${var.project}-${var.environment}-${var.component}" }
+  )
+}
+```
+
+```hcl
+# outputs.tf
+output "public_ip"  { value = aws_instance.main.public_ip }
+output "private_ip" { value = aws_instance.main.private_ip }
+```
+
+### Writing a module — terraform-aws-vpc
+
+See [terraform-aws-vpc/README.md](../terraform-aws-vpc/README.md) for the full module. Key points:
+
+- Creates VPC, IGW, public/private/database subnets, NAT GW, route tables, and optional VPC peering
+- Inputs: `project`, `environment`, subnet CIDRs, `is_peering_required`
+- Auto-selects the first two AZs in the region via a `data` source
+- Names all resources `<project>-<environment>-<tier>-<az-suffix>` using `locals`
+
+### Calling a module
+
+```hcl
+# terraform-ec2-test/main.tf
+module "module_test" {
+  source = "../terraform-aws-instance"   # path to the module directory
+
+  project       = var.project_name
+  environment   = var.env
+  component     = var.component_name
+  instance_type = var.instance_type
+  sg_ids        = var.sg_ids
+  ec2_tags      = var.ec2_tags
+}
+```
+
+```hcl
+# vpc-test/main.tf
+module "vpc" {
+  source              = "../terraform-aws-vpc"
+  project             = var.project
+  environment         = var.environment
+  is_peering_required = true
+}
+```
+
+### Accessing module outputs
+
+The caller reads module outputs as `module.<name>.<output_name>`:
+
+```hcl
+# terraform-ec2-test/outputs.tf
+output "pub_ip" {
+  value = module.module_test.public_ip   # reads the public_ip output of the module
+}
+
+output "private_ip" {
+  value = module.module_test.private_ip
+}
+```
+
+### Module with S3 remote state (Terraform 1.10+)
+
+```hcl
+# terraform-ec2-test/provider.tf
+terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "6.48.0" }
+  }
+
+  backend "s3" {
+    bucket       = "remote-state-90s"
+    key          = "ec2-test.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true   # native S3 state locking — no DynamoDB table needed
+  }
+}
+
+provider "aws" { region = "us-east-1" }
+```
+
+`use_lockfile = true` is the Terraform 1.10+ replacement for `dynamodb_table`. It stores a `.tflock` object in the same S3 bucket — no extra AWS resource to manage.
+
+---
+
+## Multi-Environment Strategies
+
+How do you use the same Terraform code across dev, UAT, and prod? Three approaches, each with trade-offs.
+
+### 1. Workspaces
+
+Terraform workspaces let you run the same code in an isolated state under a different name. The current workspace is available as `terraform.workspace`.
+
+```bash
+terraform workspace new dev
+terraform workspace new prod
+terraform workspace select prod
+```
+
+```hcl
+variable "instance_types" {
+  default = {
+    dev  = "t3.micro"
+    prod = "t3.small"
+  }
+}
+
+resource "aws_instance" "main" {
+  instance_type = var.instance_types[terraform.workspace]
+}
+```
+
+Terraform creates a separate state prefix in S3 for each workspace automatically.
+
+**Advantages:** same code, consistent structure across environments.
+
+**Disadvantages:**
+- State is stored in one bucket — no real account-level separation
+- Code grows complex: everything is conditioned on `terraform.workspace`
+- High risk of accidental changes — you are one `workspace select` away from running against prod
+- **Not recommended for production environments**
+
+---
+
+### 2. tfvars per environment
+
+Maintain one codebase with separate `.tfvars` and `backend.tf` files per environment:
+
+```
+roboshop-infra/
+├── dev/
+│   ├── backend.tf      # S3 bucket = roboshop-dev-state
+│   └── dev.tfvars      # instance_type = "t3.micro"
+└── prod/
+    ├── backend.tf      # S3 bucket = roboshop-prod-state
+    └── prod.tfvars     # instance_type = "t3.small"
+```
+
+```bash
+terraform init -reconfigure -backend-config=prod/backend.tf
+terraform apply -auto-approve -var-file=prod/prod.tfvars
+```
+
+**Advantages:** one codebase, different values per environment.
+
+**Disadvantages:**
+- Still easy to accidentally apply dev values to prod by passing the wrong `-var-file`
+- No hard boundary between environments at the code level
+
+---
+
+### 3. Separate codebase per environment (recommended)
+
+Each environment gets its own directory and its own S3 bucket:
+
+```
+roboshop-infra-dev/    → state in s3://roboshop-dev-state
+roboshop-infra-prod/   → state in s3://roboshop-prod-state
+```
+
+**Advantages:**
+- Zero risk of accidental cross-environment changes
+- Clear, hard separation — you can even use separate AWS accounts
+- State files are completely isolated
+
+**Disadvantage:** code is duplicated across environment directories.
+
+**How to handle the duplication:** use **modules**. Both `roboshop-infra-dev` and `roboshop-infra-prod` call the same `terraform-aws-vpc` and `terraform-aws-instance` modules with different variable values. The shared logic lives once in the module; the environment directory is just a thin wrapper of variable values and a backend config.
+
+```
+workspaces → not recommended (risky, state not isolated)
+tfvars     → acceptable, but still risky in practice
+separate codebase + modules → recommended (safe separation, DRY via modules)
+```
+
+---
+
+## VPC on AWS — Concepts
+
+### What is a VPC?
+
+A **Virtual Private Cloud** is a logically isolated section of the AWS cloud — like a private data center that only you can access. All resources for a project live inside a VPC; nothing outside can reach them unless you explicitly allow it.
+
+### IP Addressing and CIDR
+
+Every device on a network needs an IP address. IPv4 addresses are 32 bits written as four 8-bit octets:
+
+```
+192.168.1.5
+
+Binary: 11000000.10101000.00000001.00000101
+        192      .168      .1        .5
+```
+
+**CIDR (Classless Inter-Domain Routing)** notation specifies a range of IP addresses.  
+`/N` means the first N bits are fixed (the network part); the remaining bits are free (host addresses).
+
+```
+10.0.0.0/16  →  first 16 bits fixed (10.0), last 16 bits free
+                 2^16 = 65,536 addresses: 10.0.0.0 → 10.0.255.255
+
+10.0.1.0/24  →  first 24 bits fixed (10.0.1), last 8 bits free
+                 2^8 = 256 addresses: 10.0.1.0 → 10.0.1.255
+```
+
+### Subnets
+
+A subnet is a logical partition of the VPC CIDR. You divide a `/16` VPC into smaller `/24` subnets to separate tiers of your application:
+
+```
+VPC: 10.0.0.0/16
+
+Public subnets:   10.0.1.0/24  (1a),  10.0.2.0/24  (1b)
+Private subnets:  10.0.11.0/24 (1a),  10.0.12.0/24 (1b)
+Database subnets: 10.0.21.0/24 (1a),  10.0.22.0/24 (1b)
+```
+
+**Why three tiers?**
+
+| Tier | Who can reach it | Contains |
+|------|-----------------|---------|
+| Public | Internet + VPC | Load balancers, NAT Gateway, bastion |
+| Private | VPC only (via NAT for outbound) | Application servers |
+| Database | VPC only (via NAT for outbound) | RDS, ElastiCache |
+
+**Always span at least 2 Availability Zones** — if one AZ fails, the other keeps your service running (High Availability).
+
+### Internet Gateway
+
+An Internet Gateway is attached to the VPC and enables two-way communication between the VPC and the internet — like the router/modem at the edge of the network.
+
+Subnets with a route pointing to the IGW are **public subnets**. Subnets without that route are **private**.
+
+### Route Tables
+
+Route tables are the traffic rules — they tell packets where to go.
+
+```
+Public route table:
+  10.0.0.0/16  → local (stay inside VPC)
+  0.0.0.0/0    → Internet Gateway   ← this is what makes it "public"
+
+Private route table:
+  10.0.0.0/16  → local
+  0.0.0.0/0    → NAT Gateway        ← outbound only; no inbound from internet
+
+Database route table:
+  10.0.0.0/16  → local
+  0.0.0.0/0    → NAT Gateway
+```
+
+### NAT Gateway
+
+Private and database instances need outbound internet access (to install packages, download updates) but must not be reachable from the internet.
+
+A **NAT Gateway** sits in a public subnet with an Elastic IP. Private instances route their outbound traffic through it — the NAT Gateway forwards the request to the internet and returns the response. Inbound connections from the internet cannot be initiated.
+
+```
+Private instance → NAT Gateway (public subnet, EIP) → Internet
+Internet → [blocked — cannot initiate connection to private instance]
+```
+
+### VPC Peering
+
+Two VPCs can communicate directly without going through the internet using **VPC peering**. Common use case: a `dev` VPC needing to reach a shared services VPC (like the AWS default VPC where tools run).
+
+```hcl
+resource "aws_vpc_peering_connection" "default" {
+  count       = var.is_peering_required ? 1 : 0
+  vpc_id      = aws_vpc.main.id          # requester
+  peer_vpc_id = data.aws_vpc.default.id  # accepter (default VPC)
+  auto_accept = true
+
+  accepter  { allow_remote_vpc_dns_resolution = true }
+  requester { allow_remote_vpc_dns_resolution = true }
+}
+```
+
+### Complete VPC in Terraform — What gets created
+
+```
+aws_vpc
+aws_internet_gateway         → attached to VPC
+aws_subnet.public[0,1]       → map_public_ip_on_launch = true
+aws_subnet.private[0,1]
+aws_subnet.database[0,1]
+aws_route_table.public       → route: 0.0.0.0/0 → IGW
+aws_route_table.private      → route: 0.0.0.0/0 → NAT GW
+aws_route_table.database     → route: 0.0.0.0/0 → NAT GW
+aws_route_table_association  × 6 (one per subnet)
+aws_eip.nat                  → Elastic IP for NAT GW
+aws_nat_gateway              → placed in public subnet[0]
+aws_route (public/private/database)
+aws_vpc_peering_connection   → optional
+```
+
+The `terraform-aws-vpc` module encapsulates all of the above. Callers only need:
+
+```hcl
+module "vpc" {
+  source              = "../terraform-aws-vpc"
+  project             = "roboshop"
+  environment         = "dev"
+  is_peering_required = true
+}
+```
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -983,5 +1411,20 @@ What this creates: 10 EC2 instances + 10 per-component SGs + 1 common SG + 10 pr
 | `common_tags` pattern | Put shared tags in a variable, use `merge()` to add resource-specific ones |
 | `lifecycle` | Block that overrides Terraform's default resource update behaviour |
 | `create_before_destroy` | Create the replacement first, then destroy the old — prevents downtime |
+| **Naming convention** | `<project>-<environment>-<component>[-<az>]`; hyphens in names, underscores in Terraform labels |
+| **Module** | Reusable directory of `.tf` files; inputs via `variables.tf`, outputs via `outputs.tf` |
+| `module "x" { source = "..." }` | Call a module; pass values as arguments, read back with `module.x.output_name` |
+| `use_lockfile = true` | Terraform 1.10+ S3 native state locking — no DynamoDB table required |
+| **Workspaces** | Multiple envs from one codebase via `terraform.workspace`; risky, not recommended for prod |
+| **tfvars per env** | Separate `.tfvars` + backend config per env; lower risk than workspaces but still error-prone |
+| **Separate codebase + modules** | One directory per env with its own S3 bucket; safest, use modules to avoid code duplication |
+| **VPC** | Isolated private network in AWS — like a data center you control |
+| **CIDR /N** | First N bits fixed (network), remaining bits free (hosts); `/16` = 65 536 IPs, `/24` = 256 IPs |
+| **Public subnet** | Has a route to the Internet Gateway — instances can receive inbound traffic from internet |
+| **Private subnet** | No inbound from internet; outbound via NAT Gateway only |
+| **Internet Gateway** | VPC-level router to the internet — attach one per VPC |
+| **NAT Gateway** | In a public subnet with EIP; lets private instances reach internet outbound-only |
+| **VPC Peering** | Direct private link between two VPCs without internet; `auto_accept = true` for same-account |
+| **Route table** | Traffic rules — `0.0.0.0/0 → IGW` for public, `0.0.0.0/0 → NAT GW` for private/database |
 
 ---
