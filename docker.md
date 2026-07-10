@@ -412,6 +412,108 @@ CMD ["yahoo.com"]       # default target — overridable
 | Typical role | The whole command, or default args for ENTRYPOINT | The fixed command that always runs |
 | Best combo | Provide default arguments | Lock the executable; let CMD fill the args |
 
+### USER — drop root
+
+By default a container runs as **root**, which is a security risk — if someone breaks out of the app, they're root on the container (and potentially the host). `USER` switches to a non-root user for everything that follows.
+
+Create the user first (with `RUN useradd`), then switch to it with `USER` — placed **at least one step before `CMD`** so the container's main process runs unprivileged.
+
+```dockerfile
+# dockerfiles/USER/Dockerfile
+FROM almalinux:9
+RUN useradd roboshop
+RUN dnf install nginx -y
+
+USER roboshop           # everything after this runs as roboshop, not root
+CMD ["sleep", "100"]
+```
+
+### WORKDIR — set the working directory
+
+`WORKDIR` changes the working directory **inside the image** for the instructions that follow (and for the running container). Unlike `RUN cd /somewhere` — whose effect is lost the moment that `RUN` layer finishes — `WORKDIR` persists.
+
+```dockerfile
+# dockerfiles/WORKDIR/Dockerfile
+FROM almalinux:9
+RUN cd /tmp                       # has NO lasting effect — the cd is gone after this layer
+RUN mkdir /app
+WORKDIR /app                      # this DOES persist
+RUN echo "Present directory: ${PWD}"   # → /app
+CMD ["sleep", "100"]
+```
+
+> `RUN cd /tmp` doesn't move you anywhere for later instructions — each `RUN` starts fresh. Use `WORKDIR` to actually change directory.
+
+### ARG — build-time variables
+
+`ARG` defines a variable available **only while building** the image. It can have a default, and you override it from the command line with `--build-arg`:
+
+```bash
+docker build --build-arg version=10 -t from:v1 .
+```
+
+A special trick: `ARG` can appear **before `FROM`** to parameterise the base-image version. But an `ARG` declared before `FROM` is **not** visible after `FROM` — you must re-declare it if you need it in the body.
+
+```dockerfile
+# dockerfiles/ARG/Dockerfile
+ARG version
+FROM almalinux:${version:-9}      # default to 9 if not supplied; can't be used again after FROM
+ARG course="docker" \
+    trainer="sivakumar" \
+    duration="10hrs"
+ENV course=${course} \
+    duration=${duration} \
+    trainer=${trainer}            # promote build args into runtime env vars
+RUN echo "Course is: ${course}, Duration is: ${duration}, Trainer is: ${trainer}, Version is: ${version}"
+```
+
+### ARG vs ENV
+
+| | `ARG` | `ENV` |
+|---|-------|-------|
+| Available at build time | Yes | Yes |
+| Available inside the running container | **No** | **Yes** |
+| Override from CLI | `--build-arg name=value` | Set at run time with `-e name=value` |
+| Purpose | Build-time values (versions, credentials for build) | Runtime configuration the app reads |
+
+A common pattern (above) is to accept a value as `ARG` and then copy it into `ENV` so it's also readable inside the container.
+
+### ONBUILD — deferred instructions for downstream images
+
+`ONBUILD` registers an instruction that does **nothing in the current image** — it fires only when **someone else uses your image as their `FROM` base**. It's how you build a reusable base image that automatically wires in the downstream project's code.
+
+```dockerfile
+# dockerfiles/ONBUILD/Dockerfile — the reusable base image (built as onbuild:v1)
+FROM almalinux:9
+RUN dnf install nginx -y
+RUN rm -rf /usr/share/nginx/html/*
+ONBUILD COPY src/ /usr/share/nginx/html/   # runs in the CHILD build, not here
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+```dockerfile
+# dockerfiles/ONBUILD/test/Dockerfile — a downstream image
+FROM onbuild:v1
+# nothing else needed — the ONBUILD COPY fires here, pulling this project's src/ into nginx
+```
+
+When `onbuild:v1` is used as a base, its `ONBUILD COPY src/ …` executes as part of the child build — so any project that starts `FROM onbuild:v1` just needs a `src/` folder and gets a ready-to-serve nginx image.
+
+---
+
+## Base Image Strategy
+
+For a stateful service like MongoDB, you have two ways to get an image:
+
+1. **Build your own** — take a base OS, install MongoDB, and maintain it yourself (patches, config, upgrades)
+2. **Use the official image** — `docker pull mongo` and let the maintainers handle it
+
+Prefer the **official image** unless you have a specific reason not to — less maintenance, security patches handled upstream. In general, any image is layered as:
+
+```
+OS  +  system packages  +  software/app installation
+```
+
 ---
 
 ## Building, Tagging & Pushing Images
@@ -446,6 +548,33 @@ docker push joindevops/from:v1
 ```
 
 After pushing, anyone can `docker pull joindevops/from:v1` from Docker Hub.
+
+---
+
+## Container Networking
+
+**Container names act as DNS.** Inside a Docker network, one container can reach another by its **name** — Docker resolves the name to the container's IP. This matters because container IPs change every restart; names are stable. So an app container connects to its database as `mongodb:27017`, not by a hard-coded IP.
+
+### The default bridge network
+
+When you install Docker it creates a **default bridge network** and hands each new container an IP on it. But there's a catch:
+
+> Containers on the **default** bridge network get IPs but **cannot reach each other by name** — DNS resolution between containers doesn't work on the default bridge.
+
+### Create your own bridge network
+
+The fix — and Docker's own recommendation, for security and for name-based DNS — is to **create your own bridge network** and attach your containers to it. On a user-defined bridge, containers *can* resolve each other by name.
+
+```bash
+docker network create roboshop           # create a user-defined bridge network
+docker network ls                         # list networks
+docker run -d --name mongodb --network roboshop mongo
+docker run -d --name web --network roboshop nginx
+# 'web' can now reach the database simply as  mongodb:27017
+docker network inspect roboshop           # see attached containers and their IPs
+```
+
+Using a custom bridge network also **isolates** your app's containers from unrelated ones on the host — better security than dumping everything on the default bridge.
 
 ---
 
@@ -495,9 +624,22 @@ After pushing, anyone can `docker pull joindevops/from:v1` from Docker Hub.
 | `ADD` | Like COPY, plus fetch from URL and auto-extract tar archives |
 | `ENTRYPOINT` | Fixed start command — can't be overridden; run-time args are appended |
 | ENTRYPOINT + CMD | ENTRYPOINT locks the executable; CMD supplies overridable default args |
+| `USER` | Switch to a non-root user (place ≥1 step before CMD); don't run containers as root |
+| `WORKDIR` | Set the working directory inside the image; persists (unlike `RUN cd`) |
+| `ARG` | Build-time variable; override with `--build-arg`; **not** available in the container |
+| `ARG` before `FROM` | Parameterise the base-image version; not usable again after `FROM` |
+| ARG vs ENV | ARG = build time only; ENV = also readable inside the running container |
+| `ONBUILD` | Deferred instruction that runs when someone uses your image as their base |
+| `--build-arg name=value` | Supply/override an `ARG` at build time |
+| Official vs own image | Prefer official images (e.g. `mongo`) — upstream handles patches/maintenance |
 | `daemon off;` | Keeps a service (e.g. nginx) in the foreground so the container stays alive |
 | `docker build -t name:tag .` | Build an image from a Dockerfile (`.` = build context) |
 | `docker tag <img> <full-name>` | Retag a local image for a registry |
 | `docker login -u <user>` / `docker push` | Authenticate to and upload an image to a registry |
+| Container name = DNS | Containers reach each other by **name** (stable), not by IP (changes) |
+| Default bridge network | Auto-created; gives IPs but **no name-based DNS** between containers |
+| `docker network create <name>` | Make a user-defined bridge — enables name DNS + isolation (recommended) |
+| `docker network ls` / `inspect` | List networks / see a network's attached containers and IPs |
+| `--network <name>` | Attach a container to a specific network at run time |
 
 ---
