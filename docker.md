@@ -578,6 +578,113 @@ Using a custom bridge network also **isolates** your app's containers from unrel
 
 ---
 
+## Docker Compose
+
+### The problem it solves
+
+Running a real application by hand is tedious. For **every** service you have to `docker build` the image, then `docker run` it with the right ports, network, environment variables, and in the right **order** (a database before the app that needs it):
+
+```bash
+docker build -t frontend:v1 .
+docker run -d -p 80:80 --name frontend --network roboshop frontend:v1
+# ...now repeat build + run for the catalogue, user, cart, mysql, redis... by hand,
+#    remembering every flag and every dependency
+```
+
+A microservices app has many such containers with dependencies between them. Doing this manually is error-prone and hard to repeat.
+
+### The declarative fix
+
+**Docker Compose** is a **declarative** way to build images and run containers. Instead of typing commands, you write **one YAML file** that describes all the services, their images/builds, ports, environment, networks, volumes, and dependencies — then bring the whole stack up or down with a single command.
+
+```bash
+docker compose build      # build every service's image
+docker compose up -d      # create + start all containers, in dependency order, detached
+docker compose down       # stop and remove all containers, networks
+docker compose ps         # list this project's containers
+docker compose logs -f    # tail logs from all services
+```
+
+> **Imperative** (`docker run …` over and over) = you list every step. **Declarative** (Compose) = you describe the desired end state and let Compose figure out the steps.
+
+### The compose file
+
+A `docker-compose.yaml` is a map of **services** — each service is one container. Below is a trimmed version of the real `roboshop-docker/docker-compose.yaml`:
+
+```yaml
+name: roboshop                       # project name (prefixes resources)
+services:
+  mongodb:
+    build: ./mongodb                 # build from a Dockerfile in ./mongodb
+    image: joindevops/mongodb:v1     # tag the built image (= docker build -t joindevops/mongodb:v1)
+    container_name: mongodb
+
+  catalogue:
+    build: ./catalogue
+    image: joindevops/catalogue:v1
+    container_name: catalogue
+    depends_on:
+    - mongodb                        # start mongodb before catalogue
+
+  frontend:
+    build: ./frontend
+    image: joindevops/frontend:v1
+    container_name: frontend
+    ports:
+    - "80:80"                        # -p 80:80
+    depends_on:
+    - catalogue
+    - user
+    - cart
+
+  user:
+    build: ./user
+    image: joindevops/user:v1
+    container_name: user
+    environment:                     # -e KEY=value inside the container
+      MONGO: true
+      REDIS_URL: 'redis://redis:6379'
+      MONGO_URL: "mongodb://mongodb:27017/users"
+    depends_on:
+    - redis
+    - mongodb
+
+  redis:
+    image: redis:7                   # no build — pull an official image directly
+    container_name: redis
+
+  mysql:
+    build: ./mysql
+    image: joindevops/mysql:v1
+    container_name: mysql
+    command: --mysql-native-password=ON   # override the image's default command
+    environment:
+      MYSQL_ROOT_PASSWORD: "RoboShop@1"
+
+networks:
+  default:                           # every service uses this network unless told otherwise
+    name: roboshop
+    driver: bridge
+    external: false                  # false → Compose creates it; true → you must create it first
+```
+
+### Key fields
+
+| Field | What it does | Manual equivalent |
+|-------|--------------|-------------------|
+| `build: ./dir` | Build the image from a Dockerfile in that directory | `docker build ./dir` |
+| `image: name:tag` | Name/tag the built image, or the image to pull if no `build` | `docker build -t` / `docker pull` |
+| `container_name:` | Fixed container name (also its DNS name on the network) | `--name` |
+| `ports:` | Publish host:container ports | `-p 80:80` |
+| `environment:` | Set env vars inside the container | `-e KEY=value` |
+| `depends_on:` | Start the listed services **first** (controls order) | manual sequencing |
+| `command:` | Override the image's default `CMD` | args after `docker run image` |
+| `networks:` | Define/attach networks; `default` here is a user-defined bridge named `roboshop` | `docker network create` + `--network` |
+
+Because every service joins the same `roboshop` bridge network, they resolve each other by **container name as DNS** — that's why `MONGO_URL` is `mongodb://mongodb:27017/…` and `REDIS_URL` points at `redis:6379`. `depends_on` guarantees dependencies (mongodb, redis) start before the services that need them.
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -641,5 +748,14 @@ Using a custom bridge network also **isolates** your app's containers from unrel
 | `docker network create <name>` | Make a user-defined bridge — enables name DNS + isolation (recommended) |
 | `docker network ls` / `inspect` | List networks / see a network's attached containers and IPs |
 | `--network <name>` | Attach a container to a specific network at run time |
+| **Docker Compose** | Declarative YAML to build images + run multi-container apps in one shot |
+| `docker compose build` | Build the images for every service in the compose file |
+| `docker compose up -d` | Create + start all services (in `depends_on` order), detached |
+| `docker compose down` | Stop and remove all the stack's containers and networks |
+| `docker compose ps` / `logs -f` | List the stack's containers / tail all their logs |
+| `build:` / `image:` (compose) | Build from a dir / name the image (or pull if no build) |
+| `depends_on:` | Start listed services first — controls startup order |
+| `environment:` (compose) | Set env vars inside a service — same as `-e KEY=value` |
+| `container_name:` | Fixed name = the service's DNS name on the shared network |
 
 ---
