@@ -645,6 +645,238 @@ Kubernetes:  volumes: (pod)      +  volumeMounts: (container)
 
 ---
 
+## Storage — Volumes, PV & PVC
+
+A ConfigMap-as-volume solves *config*. Real **data** — a database's files, uploaded images, logs — is a different problem, and it's the one interviewers push on. Start from the pain:
+
+> **Everything is ephemeral, all the way down.** A pod dies → its data dies. But it's worse than that: on EKS the **nodes themselves are ephemeral** (spot reclaim, autoscaling, upgrades all replace them). So "just store it on the node" doesn't save you either — the node is as disposable as the pod. Durable data has to live **outside the cluster**, on real cloud storage.
+
+### First, know your AWS storage — this *is* an interview question
+
+You can't reason about Kubernetes storage without knowing what's underneath it. Three services, and *when* you'd pick each:
+
+| | **EBS** | **EFS** | **S3** |
+|---|---|---|---|
+| What it is | **Block** storage — a raw disk | **File** storage — a shared filesystem (NFS) | **Object** storage |
+| Mental model | A hard disk you plug in | A network drive everyone maps | A bucket reached over HTTP(S) |
+| Attach to how many instances | **One at a time** | **Many at once** | n/a — accessed over HTTP/HTTPS |
+| Size | **Fixed** — you provision N GB | **Grows automatically** | Effectively infinite |
+| Speed | **Fastest** | Slower | Not a filesystem |
+| Location constraint | **Same AZ** as the instance | Anywhere in the network | Region |
+| Security group | Not needed | **Required** | n/a |
+| Use it for | **OS disks, databases** | Shared *normal* files across many pods | Backups, artifacts, static assets |
+
+The one-liners that make it stick:
+
+- **EBS is like a hard disk; EFS is like a shared/mapped network drive.**
+- **Block vs file:** block storage stores data as raw 4 KB blocks on a disk — a *filesystem* sits on top to turn those blocks into files (CRUD on blocks). That's why EBS is a three-step ritual: **format the disk → create a filesystem → mount it.** EFS skips all that — AWS already fixed the filesystem as NFS, so your only step is **mount**.
+- **Databases → EBS, always.** EFS can't back a database (latency + file-locking semantics). Normal files that many pods must share → EFS.
+
+### Two families of Kubernetes volume
+
+```
+Volumes
+├── Ephemeral   → live and die with the pod   (emptyDir, hostPath)
+└── Persistent  → outlive the pod             (PV + PVC on EBS/EFS)
+```
+
+Same `volumes` (pod level) + `volumeMounts` (container level) wiring you already know — what changes is what sits behind the volume.
+
+### Ephemeral: `emptyDir`
+
+An **empty directory created when the pod is scheduled, deleted when the pod dies.** It's not for keeping data — it's **scratch space shared between containers in the same pod** (remember: containers in a pod share storage).
+
+The classic use is the **sidecar logging pattern**: the app writes logs to the shared dir, a second container reads them and ships them to ELK.
+
+```yaml
+# k8-resources/volumes/01-emptyDir.yaml
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    volumeMounts:
+    - mountPath: /var/log/nginx        # app writes logs here
+      name: nginx-logs
+  - name: almalinux                     # sidecar
+    image: almalinux:9
+    command: ["sleep", "1000"]
+    volumeMounts:
+    - mountPath: /mnt/nginx-logs        # sidecar reads the SAME volume
+      name: nginx-logs
+      readOnly: true                    # sidecar only reads — good hygiene
+  volumes:
+  - name: nginx-logs
+    emptyDir:                           # empty dir on the node, gone when the pod is
+      sizeLimit: 500Mi
+```
+
+Two containers, one volume, mounted at *different paths* — that's the whole point of `emptyDir`.
+
+### Ephemeral: `hostPath` — powerful and dangerous
+
+**`hostPath` mounts a directory from the node itself into the pod.** Sounds useful; it's a trap for application data, for one blunt reason:
+
+> A pod is **not pinned to a node**. Delete it and it may reschedule onto a **different** node — where your `hostPath` data doesn't exist. Your data is stranded on the old node.
+
+So `hostPath` is **never for app data.** Its legitimate use is the mirror image: not putting data *in*, but reading the **node's own files out** — shipping **host** logs/metrics to ELK. And you do it **`readOnly: true`** as a guardrail, because giving a pod write access to the host filesystem is a serious security hole.
+
+This is where **DaemonSet** clicks into place — the fourth "set" from earlier:
+
+> **DaemonSet = exactly one pod on every node.** Pair it with `hostPath` and you have an agent on each node reading that node's `/var/log` and shipping it out. That's *the* canonical log/metrics-collector pattern.
+
+```yaml
+# k8-resources/volumes/02-host-path.yaml
+apiVersion: apps/v1
+kind: DaemonSet                          # one per node
+metadata:
+  name: fluentd-elasticsearch
+  namespace: kube-system                 # an ADMIN namespace, not yours
+spec:
+  template:
+    spec:
+      containers:
+      - name: fluentd-elasticsearch
+        image: quay.io/fluentd_elasticsearch/fluentd:v5.0.1
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true                 # read the host's logs, never write
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log                 # the node's own log directory
+```
+
+Note the namespace: `kube-system`. **`hostPath` is an administrator activity**, not something app teams do in their own namespace — it reaches outside the Kubernetes abstraction and touches the host, which is a cluster-admin concern.
+
+### Persistent storage: the org chart is the real lesson
+
+Here's the mental model interviews are actually testing. In an on-prem cluster, getting a disk is a **process**, not a command:
+
+```
+1. raise a ticket, get manager approval
+2. storage team gets the ticket — you state size, reason
+3. their lead approves, a member provisions the disk, hands you the address
+4. you email the admin team to wire it in
+```
+
+Kubernetes admins don't know storage internals, and storage teams don't know Kubernetes. So Kubernetes put **wrapper objects on top of the raw disk** to divide the responsibility cleanly — **PV, PVC, SC**:
+
+| Object | Full name | Who owns it | Analogy |
+|--------|-----------|-------------|---------|
+| **PV** | PersistentVolume | **Storage/cluster admin** | The **wallet** (the actual disk) |
+| **PVC** | PersistentVolumeClaim | **App developer** | The **request** for spending money |
+| **SC** | StorageClass | Admin (enables automation) | The rule that **creates wallets on demand** |
+
+The family chain from the notes nails the separation of concerns:
+
+```
+son  →  mother  →  father  →  wallet
+Pod  →   PVC    →   PV     →  storage
+```
+
+The **son (Pod) never touches the wallet (disk) directly.** He asks his mother (PVC), who goes to the father (PV), who holds the wallet (real EBS/EFS). Each layer only talks to its neighbour — so the app developer writes a **PVC** ("I need 2Gi, read-write") and never has to know the volume ID, the AZ, or the CSI driver. That decoupling *is* the reason PV/PVC exist. If someone asks "why not mount the disk straight into the pod?" — this is the answer: **it separates the person who needs storage from the person who provisions it.**
+
+- **PV** = the logical Kubernetes representation of a real disk. The physical disk, as a K8s object.
+- **PVC** = a claim against a PV — "give me this much, with these access rights." The pod references the *claim*, never the PV.
+
+### Static vs dynamic provisioning
+
+| | **Static** | **Dynamic** |
+|---|---|---|
+| Who creates the disk | **You**, manually (create the EBS volume, then the PV) | **Kubernetes**, automatically via a **StorageClass** |
+| When | Ahead of time | The moment a PVC asks |
+| Real-world use | Rare / learning | The norm in production |
+
+The example below is **static** — the disk already exists (`volumeHandle: vol-...`) and you're describing it to Kubernetes by hand. Getting there needs plumbing worth naming because it's classic interview/debug territory:
+
+1. Install the **EBS CSI driver** (the thing that lets K8s attach EBS)
+2. The **EKS nodes need IAM permission** (`EBSCSIDriverPolicy`) to attach disks — miss this and volumes hang in `Pending`
+3. Create the EBS volume **in the same AZ as a node** (EBS is AZ-locked)
+4. Write the PV, then the PVC, then reference the PVC in the pod
+
+```yaml
+# k8-resources/volumes/03-ebs-static.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ebs-static
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 2Gi
+  csi:
+    driver: ebs.csi.aws.com              # the EBS CSI driver
+    fsType: ext4
+    volumeHandle: vol-0298e8f2bbbde0f28  # the pre-created EBS volume (static)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ebs-static
+spec:
+  storageClassName: ""                   # "" = don't use the default SC; bind to MY PV
+  volumeName: ebs-static                 # explicitly bind to the PV above
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ebs-static
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    volumeMounts:
+    - name: persistent-storage
+      mountPath: /usr/share/nginx/html
+  volumes:
+  - name: persistent-storage
+    persistentVolumeClaim:
+      claimName: ebs-static              # the pod references the CLAIM, not the PV
+  nodeSelector:
+    topology.kubernetes.io/zone: us-east-1d   # pin the pod to the disk's AZ
+```
+
+Two details that trip people up:
+
+- **`storageClassName: ""`** is deliberate. An empty string means "do **not** fall back to the default StorageClass" — you want this PVC to bind to *your* named PV, not have K8s dynamically provision a new disk.
+- **`nodeSelector` on the AZ.** EBS is AZ-locked, so the pod *must* land in the same AZ as the disk (`us-east-1d`) or it can never mount it. This is the single most common EBS-on-K8s failure.
+
+### Access modes — asked constantly
+
+Who can mount the volume, and how. Directly reflects EBS-vs-EFS reality (EBS = one node; EFS = many):
+
+| Mode | Meaning |
+|------|---------|
+| **ReadWriteOnce** (RWO) | One **node** mounts read-write; pods *on that node* can use it → typical **EBS** |
+| **ReadOnlyMany** (ROX) | Many **nodes** mount, read-only |
+| **ReadWriteMany** (RWX) | Many **nodes** mount read-write → needs **EFS** (EBS can't do this) |
+| **ReadWriteOncePod** | Exactly **one pod** read-write — stricter than RWO (node-wide) |
+
+Interview trap: RWO is *once per **node**,* not per pod — several pods on the same node can share an RWO volume. If you truly need one-pod exclusivity, that's **ReadWriteOncePod**.
+
+### Reclaim policy — what happens to the data when the PVC is deleted
+
+| Policy | PV object | The actual data |
+|--------|-----------|-----------------|
+| **Delete** | Removed | **Destroyed** — the underlying disk is deleted too |
+| **Retain** | Kept | **Preserved** — data survives even after PVC/pod are gone (you clean up manually) |
+| **Recycle** | Kept | **Wiped** but the disk stays (deprecated) |
+
+The one that matters in production: **use `Retain` for anything you can't afford to lose.** `Delete` is convenient and will happily take your database down with the PVC. This is a real blast-radius question — "what happens to the data if someone `kubectl delete pvc`?" — and the honest answer is "depends on the reclaim policy," which is exactly the point.
+
+### Where the scheduler comes in
+
+The **scheduler** decides which node a pod runs on, weighing many factors — and storage is one of them. That EBS `nodeSelector` above is you *overriding* the scheduler to force the pod into the disk's AZ. Worth knowing the scheduler is steerable (`nodeSelector`, affinity, taints/tolerations) precisely because AZ-locked storage sometimes forces your hand.
+
+---
+
 ## Health Checks — Probes
 
 Kubernetes can't know whether your app is *actually working* — a running process isn't the same as a healthy app. **Probes** are how you tell it. Three of them, answering three different questions:
@@ -778,6 +1010,21 @@ Compare it to the Compose file from the Docker sessions and it's the same applic
 | ConfigMap as a file | Key = filename, value = file contents; mount it as a volume |
 | `volumes` vs `volumeMounts` | Pod level (attach the disk) vs container level (where it appears) |
 | `subPath` | Mount a single file without replacing the whole directory |
+| Everything is ephemeral | Pod dies → data dies; on EKS **nodes** are ephemeral too → durable data lives outside |
+| **EBS vs EFS vs S3** | Block (1 node, fast, DBs) / File-NFS (many nodes, shared files) / Object (HTTP) |
+| EBS ritual | Block storage → **format → filesystem → mount**; EFS is NFS, only **mount** |
+| Ephemeral volumes | `emptyDir` (pod scratch, shared between containers) & `hostPath` (node's dir) |
+| `emptyDir` | Empty dir born/dies with the pod; sidecar-logging scratch space |
+| `hostPath` | Mounts a **node** dir; never for app data (pod may reschedule elsewhere); `readOnly` |
+| **DaemonSet + hostPath** | One pod per node reading its `/var/log` → the log/metrics-collector pattern |
+| **PV / PVC / SC** | Disk-as-K8s-object / the developer's claim / dynamic-provisioning rule |
+| Pod → PVC → PV → storage | son → mother → father → wallet; app never touches the disk directly |
+| Static vs dynamic | You create the disk + PV / a StorageClass creates it when a PVC asks |
+| EBS static gotchas | CSI driver + node IAM (`EBSCSIDriverPolicy`) + same-AZ disk + `nodeSelector` |
+| `storageClassName: ""` | Bind to my named PV; do **not** fall back to the default StorageClass |
+| **Access modes** | RWO (1 node) / ROX (many RO) / RWX (many RW → EFS) / RWOncePod (1 pod) |
+| **Reclaim policy** | Delete (disk destroyed) / **Retain** (data survives) / Recycle (wiped, deprecated) |
+| Scheduler | Picks the node; steer it with `nodeSelector`/affinity — needed for AZ-locked EBS |
 | **startupProbe** | Has it booted? Runs **once**; buys slow starters time |
 | **readinessProbe** | Ready for traffic? Fails → **removed from Service endpoints** (no restart) |
 | **livenessProbe** | Still alive? Fails → **pod restarted** |
