@@ -1162,28 +1162,229 @@ EFS is a network filesystem — the latency and file-locking behaviour that make
 
 ---
 
-## Toward StatefulSet — Why Deployments Aren't Enough
+## StatefulSet
 
-*(Started this session, covered properly next session.)*
+### First: why shared storage breaks a database cluster
 
-Think concretely about running **MySQL in Kubernetes** with more than one replica. Three requirements appear, and a Deployment satisfies **none** of them:
+This is the argument that justifies the whole resource, and it's worth being able to reason through out loud.
 
-1. **Each pod needs its own storage.** Two database pods writing the same disk corrupts it — every replica needs a separate volume.
-2. **Pods must be discoverable by their peers.** A write landing on one pod has to be replicated to the others, so each pod needs a **stable, addressable identity** — not a random name and a new IP each restart.
-3. **A restarted pod must reattach to *its own* volume.** If pod-0 dies and comes back, it must find the exact disk it had before, not a fresh one.
+Picture a **3-node database cluster sharing one disk.** A write arrives at NODE-A, which starts modifying the disk. To stop NODE-B corrupting the same data at the same time, you must **lock** the other nodes.
 
-That's the whole problem. A **Deployment** is built for **stateless** apps, where every replica is interchangeable and they can all share one volume. For **stateful** apps, Kubernetes provides a different controller — the **StatefulSet**.
+> And there's the contradiction: **if NODE-B has to wait for NODE-A, there is no point having a cluster.** You've bought three servers to get the throughput of one.
+
+The fix is the opposite arrangement — **give every node its own storage.** No locking, no waiting. When NODE-A takes a write, it sends an **asynchronous replication** request to its peers, and they apply it to their own disks.
+
+So for stateful applications on Kubernetes, **every pod must have its own storage.** A Deployment can't express that, so Kubernetes has a separate resource: the **StatefulSet**.
+
+### What a StatefulSet gives you
+
+| # | Property | Why it matters |
+|---|----------|----------------|
+| 1 | **Own PV/PVC per pod** | Each replica gets its own disk — no locking, no corruption |
+| 2 | **Needs a headless Service** (plus a normal one) | So pods can discover their **peers** to replicate to |
+| 3 | **Stable, predictable pod names** | `mysql-0`, `mysql-1` — not a random suffix |
+| 4 | **Ordered creation and deletion** | Pods come up `-0`, `-1`, `-2` and are removed in reverse |
+
+Points 3 and 4 are what "stateful identity" actually means. `mysql-0` is *always* `mysql-0`, always reattaches to `mysql-0`'s disk, and always starts before `mysql-1`. Databases need that determinism to form a cluster reliably.
+
+### Headless Service — the peer-discovery mechanism
+
+A common interview question: **what is a headless service, and why does a StatefulSet need one?**
+
+**A Service with `clusterIP: None` is a headless service.** The difference is entirely in what DNS returns:
+
+| | **Normal Service** | **Headless Service** (`clusterIP: None`) |
+|---|---|---|
+| `nslookup <svc-name>` returns | **One** IP — the service's ClusterIP | **All the endpoints** (every pod IP) behind it |
+| Traffic | Load-balanced to one pod | You talk to pods **directly** |
+| Used for | Clients that just need *any* healthy pod | Pods that need to find **every peer** |
+
+A normal Service is a front door — it deliberately hides which pod you reach, which is exactly right for `catalogue` or `frontend`. But a database node replicating data doesn't want *any* pod; it needs **all of them**. So it does an `nslookup` on the headless service and gets back **every endpoint in the cluster**, then opens connections to its peers.
+
+That's why every roboshop database declares **two** services:
+
+```yaml
+# k8-roboshop-v2/mongodb/manifest.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless          # for peer discovery between pods
+  namespace: roboshop
+spec:
+  ports:
+  - protocol: TCP
+    port: 27017
+    targetPort: 27017
+  clusterIP: None                 # ← headless
+  selector:
+    project: roboshop
+    component: mongodb
+    tier: db
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb                   # normal ClusterIP — what catalogue/user connect to
+  namespace: roboshop
+spec:
+  ports:
+  - protocol: TCP
+    port: 27017
+    targetPort: 27017
+  selector:
+    project: roboshop
+    component: mongodb
+    tier: db
+```
+
+The application services keep using the normal one (`MONGO_URL: "mongodb://mongodb:27017/catalogue"`); the database pods use the headless one among themselves.
+
+### `volumeClaimTemplates` — a PVC per pod
+
+The key structural difference from a Deployment. Instead of one `volumes:` block shared by every replica, a StatefulSet has a **`volumeClaimTemplates`** — a *template* Kubernetes stamps into a **separate PVC for each pod**.
+
+```yaml
+# k8-roboshop-v2/mongodb/manifest.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: roboshop
+spec:
+  selector:
+    matchLabels:
+      project: roboshop
+      component: mongodb
+      tier: db
+  serviceName: "mongodb-headless"      # ← points at the HEADLESS service
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        project: roboshop
+        component: mongodb
+        tier: db
+    spec:
+      containers:
+      - name: mongodb
+        image: joindevops/mongodb:4.0.0
+        volumeMounts:
+        - name: mongodb
+          mountPath: /data/db              # mongo's data directory
+  # PVC template — one disk created PER POD
+  volumeClaimTemplates:
+  - metadata:
+      name: mongodb
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "roboshop-ebs"     # the dynamic EBS StorageClass
+      resources:
+        requests:
+          storage: 1Gi
+```
+
+Three details worth pointing at:
+
+- **`serviceName: "mongodb-headless"`** — a StatefulSet must be told which headless service governs its pods' DNS identities.
+- **`volumeClaimTemplates`** relies on the dynamic **`roboshop-ebs`** StorageClass from the previous session. Scale to 3 replicas and Kubernetes creates **three** EBS volumes, one per pod, automatically. This is dynamic provisioning paying off.
+- **`ReadWriteOnce`** is correct here precisely *because* each pod has its own disk — no sharing means no need for `ReadWriteMany`.
+
+Every roboshop database follows this identical shape — `mongodb` (`/data/db`), `mysql` (`/var/lib/mysql`), `redis` (`/data`), and `rabbitmq` — each with a headless service, a normal service, a StatefulSet, and a `volumeClaimTemplates`.
 
 ### Deployment vs StatefulSet
 
 | | **Deployment** | **StatefulSet** |
 |---|---|---|
 | Built for | **Stateless** applications | **Stateful** applications |
-| Storage | All replicas share the **same** volume | **Each pod gets its own** volume |
-| Pod identity | Random suffix (`frontend-7d9f8b-xk2p9`), interchangeable | Stable ordinal (`mysql-0`, `mysql-1`), sticky |
-| On restart | Any pod, any volume | The **same pod name reattaches to the same volume** |
+| Storage | All replicas share the **same** volume | **Each pod gets its own** volume (`volumeClaimTemplates`) |
+| Pod names | Random suffix (`catalogue-7d9f8b-xk2p9`) | Stable ordinal (`mongodb-0`, `mongodb-1`) |
+| Pod identity | Interchangeable — any pod is as good as another | **Sticky** — a pod always reattaches to its own disk |
+| Creation / deletion | All at once, any order | **Ordered** — `-0`, then `-1`, then `-2`; deleted in reverse |
+| Service needed | A normal Service | A **headless** Service *and* usually a normal one |
+| Roboshop examples | frontend, catalogue, user, cart, shipping, payment | mongodb, mysql, redis, rabbitmq |
 
-This closes a loop opened right back at the start of the Docker notes: *stateless apps are easy to containerise, stateful ones need special care.* StatefulSet is the shape that care takes in Kubernetes.
+This closes a loop opened at the very start of the Docker notes: *stateless apps are easy to containerise; stateful ones need special care.* StatefulSet is the shape that care takes in Kubernetes.
+
+---
+
+## Scaling and the Horizontal Pod Autoscaler
+
+### Horizontal vs vertical scaling
+
+| | **Vertical scaling** | **Horizontal scaling** |
+|---|---|---|
+| What you do | Make the **existing** server bigger — more CPU/RAM/disk | Add **another** server to share the load |
+| Downtime | **Yes** — you must resize and restart it | **None** |
+| Single point of failure | **Yes** — still one machine | **No** — many machines |
+| Ceiling | Limited by the biggest machine available | Effectively unlimited |
+
+Vertical scaling has a hard ceiling and a restart; horizontal scaling doesn't. **Kubernetes is built around horizontal scaling** — that's what `replicas` means, and the autoscaler automates it.
+
+### HorizontalPodAutoscaler
+
+An **HPA** watches a metric (usually CPU) and **adds or removes pod replicas automatically** to keep that metric near a target.
+
+There's a hard prerequisite, and it's the usual reason an HPA sits there doing nothing:
+
+> **A pod consumes resources dynamically.** The HPA measures utilisation as a **percentage of the pod's `requests`** — so if a container has no `requests` set, there's no denominator and the HPA has nothing to compute. **Resource requests/limits are mandatory for autoscaling.**
+
+That's why the v2 manifests add a `resources` block alongside the HPA:
+
+```yaml
+# k8-roboshop-v2/catalogue/manifest.yaml
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: catalogue
+spec:
+  scaleTargetRef:                  # WHAT to scale
+    apiVersion: apps/v1
+    kind: Deployment
+    name: catalogue
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50     # keep average CPU at ~50% of requests
+```
+
+How to read it: *"keep `catalogue` between 1 and 10 pods, adding replicas whenever average CPU across the pods exceeds **50% of the requested 100m**, and removing them when it falls below."* Utilisation is a plain percentage — **90% means 90 out of 100**, measured against `requests`, not against the node.
+
+> Note the HPA targets a **Deployment** — stateless services are the ones you autoscale. You generally don't autoscale a database StatefulSet; adding a replica there means joining a cluster and replicating data, which isn't something a CPU threshold should trigger.
+
+### Controlling *where* pods land
+
+Scaling decides **how many** pods; a separate family of settings decides **which node** each one goes to. Three mechanisms, worth knowing by name:
+
+| Mechanism | What it does |
+|-----------|--------------|
+| **Taints and tolerations** | The *node* repels pods; only pods with a matching **toleration** may land there |
+| **Node affinity / anti-affinity** | The *pod* states a preference or requirement about **which nodes** it wants |
+| **Pod affinity / anti-affinity** | The *pod* states a preference about **which other pods** to sit with or avoid |
+
+The distinction that sticks: **taints are the node pushing pods away; affinity is the pod pulling itself toward (or away from) something.** Pod anti-affinity is how you spread database replicas across different nodes so one node failure can't take out the whole cluster.
+
+*(`nodeSelector` — used earlier to pin a pod to the EBS volume's AZ — is the simplest member of this family.)*
+
+### k9s
+
+A terminal UI for the cluster — far faster than typing `kubectl get`/`describe` repeatedly when you're watching pods roll or debugging a StatefulSet come up:
+
+```bash
+curl -sS https://webinstall.dev/k9s | bash
+```
 
 ---
 
@@ -1262,6 +1463,26 @@ This closes a loop opened right back at the start of the Docker notes: *stateles
 | **EBS vs EFS rule** | **EBS for databases, EFS for file storage** — never a DB on EFS |
 | Why MySQL needs StatefulSet | Own volume per pod + stable discoverable identity + reattach to the same disk |
 | **Deployment vs StatefulSet** | Stateless, shared volume, random names / stateful, volume per pod, sticky `mysql-0` |
+| Why not shared storage for a DB | You'd have to lock the other nodes — if B waits for A, the cluster is pointless |
+| Async replication | Each node owns its disk; a write on NODE-A replicates asynchronously to peers |
+| **StatefulSet requirements** | Own PV/PVC per pod + headless Service + stable names + ordered create/delete |
+| Pod naming | `<statefulset>-0`, `-1`, `-2`; created in order, deleted in reverse |
+| **Headless Service** | A Service with **`clusterIP: None`** |
+| Normal vs headless DNS | `nslookup` returns **one ClusterIP** vs **all endpoints** (every pod IP) |
+| Why StatefulSets need headless | Peers must discover **every** pod to replicate to, not just any one |
+| Two services per DB | `mongodb-headless` for peers, `mongodb` for the app services |
+| `serviceName:` | Tells a StatefulSet which headless Service governs its pods' DNS |
+| **`volumeClaimTemplates`** | PVC *template* — Kubernetes creates one disk **per pod** |
+| **Vertical scaling** | Bigger server — causes downtime, single point of failure, hard ceiling |
+| **Horizontal scaling** | More servers — no downtime, no SPOF; what Kubernetes is built around |
+| **HPA** | Adds/removes replicas to hold a metric near target (`scaleTargetRef`, min/max) |
+| HPA prerequisite | Requires `resources.requests` — utilisation is a **% of requests**, else no denominator |
+| `averageUtilization: 50` | Keep average CPU at ~50% of the **requested** CPU (90% = 90 out of 100) |
+| What to autoscale | Deployments (stateless); not DB StatefulSets — replicas there mean cluster joins |
+| **Taints + tolerations** | The **node repels** pods; only pods tolerating the taint may land |
+| **Node affinity** | The **pod chooses** which nodes it wants (`nodeSelector` is the simple form) |
+| **Pod (anti-)affinity** | The pod chooses which **other pods** to sit with / avoid — spreads DB replicas |
+| **k9s** | Terminal UI for the cluster; far faster than repeated `kubectl get/describe` |
 | **startupProbe** | Has it booted? Runs **once**; buys slow starters time |
 | **readinessProbe** | Ready for traffic? Fails → **removed from Service endpoints** (no restart) |
 | **livenessProbe** | Still alive? Fails → **pod restarted** |
