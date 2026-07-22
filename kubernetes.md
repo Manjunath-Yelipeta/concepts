@@ -645,6 +645,92 @@ Kubernetes:  volumes: (pod)      +  volumeMounts: (container)
 
 ---
 
+## Health Checks — Probes
+
+Kubernetes can't know whether your app is *actually working* — a running process isn't the same as a healthy app. **Probes** are how you tell it. Three of them, answering three different questions:
+
+| Probe | Question | Runs | On failure |
+|-------|----------|------|-----------|
+| **startupProbe** | *Has the container finished booting?* | **Once**, at startup | Keeps waiting; other probes don't start until this passes |
+| **readinessProbe** | *Is the container ready to accept traffic?* | **Continuously** | **Removes the pod from the Service endpoints** — no traffic, but no restart |
+| **livenessProbe** | *Is the application still alive?* | **Continuously** | **Restarts** the pod |
+
+The distinction that matters:
+
+- **Readiness failing** → "don't send it traffic right now" (it might be busy or warming up). Stop routing, wait.
+- **Liveness failing** → "it's wedged and won't recover." Long-running apps get stuck holding locks; restarting is the only fix.
+
+**startupProbe** exists so slow-booting apps don't get killed by a liveness probe before they've even started.
+
+```yaml
+# k8-roboshop/payment/manifest.yaml
+containers:
+- name: payment
+  image: joindevops/payment:4.0.0
+  ports:
+  - name: liveness-port
+    containerPort: 8080
+  startupProbe:
+    httpGet:
+      path: /health
+      port: liveness-port
+    failureThreshold: 12        # 12 × 10s = 5 minutes to boot before giving up
+    periodSeconds: 10
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: liveness-port
+    periodSeconds: 10
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: liveness-port
+    periodSeconds: 10
+```
+
+`failureThreshold: 12` × `periodSeconds: 10` = **the app gets 5 minutes to start**. That's the startup probe's whole job: buy slow starters enough time.
+
+The app needs an endpoint to answer — roboshop's nginx config defines one:
+
+```nginx
+location /health {
+  stub_status on;
+  access_log off;
+}
+```
+
+---
+
+## The Standard Resource Set
+
+Putting it together — what a real service in roboshop is made of:
+
+| # | Resource | Why |
+|---|----------|-----|
+| 1 | **Namespace** | `roboshop` — the project's isolated space |
+| 2 | **Deployment** | **Not** a bare Pod, **not** a ReplicaSet — you want rollouts |
+| 3 | **ConfigMap** | Non-sensitive configuration |
+| 4 | **Secret** | Sensitive values |
+| 5 | **Service** | ClusterIP for internal, LoadBalancer to expose |
+
+That's the pattern every `k8-roboshop/*/manifest.yaml` follows. The shape of the app in Kubernetes:
+
+```
+                      LoadBalancer Service
+                              │
+                          frontend  (nginx + configMap-mounted nginx.conf)
+                              │  proxy_pass
+        ┌──────────┬──────────┼──────────┬──────────┐
+    catalogue    user       cart     shipping   payment      ← ClusterIP services
+        │          │          │          │          │
+     mongodb   mongodb     redis      mysql    rabbitmq      ← ClusterIP services
+                +redis
+```
+
+Compare it to the Compose file from the Docker sessions and it's the same application — the same names, the same DNS-by-name wiring, the same dependencies. What changed is that Kubernetes now handles the scaling, the health, the rollouts, and the load balancing that Compose couldn't.
+
+---
+
 ## Storage — Volumes, PV & PVC
 
 A ConfigMap-as-volume solves *config*. Real **data** — a database's files, uploaded images, logs — is a different problem, and it's the one interviewers push on. Start from the pain:
@@ -877,89 +963,227 @@ The **scheduler** decides which node a pod runs on, weighing many factors — an
 
 ---
 
-## Health Checks — Probes
+## Dynamic Provisioning — StorageClass
 
-Kubernetes can't know whether your app is *actually working* — a running process isn't the same as a healthy app. **Probes** are how you tell it. Three of them, answering three different questions:
+Static provisioning has an obvious problem: **a human has to create a disk before anyone can use it.** That doesn't scale, and it's why static is rare in production.
 
-| Probe | Question | Runs | On failure |
-|-------|----------|------|-----------|
-| **startupProbe** | *Has the container finished booting?* | **Once**, at startup | Keeps waiting; other probes don't start until this passes |
-| **readinessProbe** | *Is the container ready to accept traffic?* | **Continuously** | **Removes the pod from the Service endpoints** — no traffic, but no restart |
-| **livenessProbe** | *Is the application still alive?* | **Continuously** | **Restarts** the pod |
+A **StorageClass** is the fix — it's a **recipe for creating storage on demand**. Point a PVC at a StorageClass and Kubernetes provisions **both the real disk and its PV automatically**. You typically keep one StorageClass per storage type: one for EBS, one for EFS.
 
-The distinction that matters:
+The analogy extends neatly:
 
-- **Readiness failing** → "don't send it traffic right now" (it might be busy or warming up). Stop routing, wait.
-- **Liveness failing** → "it's wedged and won't recover." Long-running apps get stuck holding locks; restarting is the only fix.
+```
+static   →  son  →  mother  →  father  →  wallet          (a physical wallet handed over)
+dynamic  →  son  →  mother  →  PhonePe wallet             (money appears on demand — no father, no physical wallet)
+```
 
-**startupProbe** exists so slow-booting apps don't get killed by a liveness probe before they've even started.
+With dynamic provisioning the **PV layer stops being a person's job.** The developer writes a PVC; nobody files a ticket.
+
+### The two workflows side by side
+
+| Step | **EBS static** | **EBS dynamic** |
+|------|----------------|-----------------|
+| 1 | Install EBS CSI drivers | Install EBS CSI drivers |
+| 2 | `EBSCSIDriverPolicy` IAM on worker nodes | `EBSCSIDriverPolicy` IAM on worker nodes |
+| 3 | **Create the disk manually** | **Create a StorageClass** |
+| 4 | **Create the PV** | — *(created automatically)* |
+| 5 | Create the PVC | Create the PVC |
+| 6 | Attach the volume in the pod | Attach the volume in the pod |
+
+Two manual steps disappear — and with them, the AZ headache.
+
+### The StorageClass
 
 ```yaml
-# k8-roboshop/payment/manifest.yaml
-containers:
-- name: payment
-  image: joindevops/payment:4.0.0
-  ports:
-  - name: liveness-port
-    containerPort: 8080
-  startupProbe:
-    httpGet:
-      path: /health
-      port: liveness-port
-    failureThreshold: 12        # 12 × 10s = 5 minutes to boot before giving up
-    periodSeconds: 10
-  readinessProbe:
-    httpGet:
-      path: /health
-      port: liveness-port
-    periodSeconds: 10
-  livenessProbe:
-    httpGet:
-      path: /health
-      port: liveness-port
-    periodSeconds: 10
+# k8-resources/volumes/04-ebs-sc.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: roboshop-ebs
+provisioner: ebs.csi.aws.com          # WHO creates the disk — the EBS CSI driver
+reclaimPolicy: Retain                  # keep the data if the PVC is deleted
+volumeBindingMode: WaitForFirstConsumer
 ```
 
-`failureThreshold: 12` × `periodSeconds: 10` = **the app gets 5 minutes to start**. That's the startup probe's whole job: buy slow starters enough time.
+Then the PVC just names it — no PV anywhere in sight:
 
-The app needs an endpoint to answer — roboshop's nginx config defines one:
-
-```nginx
-location /health {
-  stub_status on;
-  access_log off;
-}
+```yaml
+# k8-resources/volumes/05-ebs-dynamic.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ebs-dynamic
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: roboshop-ebs       # "make me one of these"
+  resources:
+    requests:
+      storage: 6Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ebs-dynamic
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    volumeMounts:
+    - name: persistent-storage
+      mountPath: /usr/share/nginx/html
+  volumes:
+  - name: persistent-storage
+    persistentVolumeClaim:
+      claimName: ebs-dynamic
 ```
+
+Compare this to the static example — **no PV, no `volumeHandle`, no `nodeSelector`.** That's the payoff.
+
+### `volumeBindingMode: WaitForFirstConsumer` — the detail worth understanding
+
+This is the single best thing to be able to explain about StorageClasses, because it solves the exact AZ problem that forced a `nodeSelector` in the static example.
+
+Follow the actual sequence:
+
+```
+1. you send the pod definition to EKS
+2. the SCHEDULER assigns the pod to a node
+3. that node pulls the image
+4. the pod claims storage through its PVC
+5. EKS creates the EBS volume — in the SAME AZ as the node it landed on
+```
+
+The disk is created **after** the pod is scheduled, so Kubernetes already knows which AZ to build it in. Storage follows the pod instead of the pod being pinned to storage.
+
+> The alternative (`Immediate`) creates the disk the moment the PVC is made — before any pod exists — so it can easily land in an AZ with no room for your pod, and the pod then hangs `Pending` forever. **For EBS, `WaitForFirstConsumer` is the right default.**
 
 ---
 
-## The Standard Resource Set
+## EFS — Shared Storage
 
-Putting it together — what a real service in roboshop is made of:
+EBS gives one node a fast disk. But `ReadWriteMany` — many pods across many nodes writing the same data — **EBS simply cannot do**. That's EFS's job.
 
-| # | Resource | Why |
-|---|----------|-----|
-| 1 | **Namespace** | `roboshop` — the project's isolated space |
-| 2 | **Deployment** | **Not** a bare Pod, **not** a ReplicaSet — you want rollouts |
-| 3 | **ConfigMap** | Non-sensitive configuration |
-| 4 | **Secret** | Sensitive values |
-| 5 | **Service** | ClusterIP for internal, LoadBalancer to expose |
-
-That's the pattern every `k8-roboshop/*/manifest.yaml` follows. The shape of the app in Kubernetes:
+### EFS static
 
 ```
-                      LoadBalancer Service
-                              │
-                          frontend  (nginx + configMap-mounted nginx.conf)
-                              │  proxy_pass
-        ┌──────────┬──────────┼──────────┬──────────┐
-    catalogue    user       cart     shipping   payment      ← ClusterIP services
-        │          │          │          │          │
-     mongodb   mongodb     redis      mysql    rabbitmq      ← ClusterIP services
-                +redis
+1. install the EFS CSI drivers
+2. add EFSCSIDriverPolicy to the node IAM role
+3. create the EFS filesystem — and allow port 2049 in its security group
+4. create the PV
+5. create the PVC
+6. claim it in the pod
 ```
 
-Compare it to the Compose file from the Docker sessions and it's the same application — the same names, the same DNS-by-name wiring, the same dependencies. What changed is that Kubernetes now handles the scaling, the health, the rollouts, and the load balancing that Compose couldn't.
+**Port 2049 is NFS.** Forget that security group rule and everything mounts... nothing — it just hangs. This is the EFS equivalent of the AZ mistake, and it's the first thing to check when an EFS mount stalls. (Recall from the storage table: **EFS needs a security group; EBS doesn't.**)
+
+```yaml
+# k8-resources/volumes/06-efs-static.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: efs-static
+spec:
+  # capacity is DUMMY for EFS — the API demands a number, but EFS grows on its own
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany                    # the whole point of EFS
+  storageClassName: ""                 # static → no StorageClass
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: efs:fs-042342d611e8847c4   # the EFS filesystem ID
+```
+
+Two things to notice, both common interview fodder:
+
+- **`capacity: 5Gi` is fiction.** EFS grows automatically — the field exists only because the API requires it. Contrast with EBS, where the size is real and fixed.
+- **`accessModes: ReadWriteMany`** — this is what you came to EFS for.
+
+### EFS dynamic
+
+Same driver + IAM + port-2049 setup, then a StorageClass instead of a hand-written PV:
+
+```yaml
+# k8-resources/volumes/07-efs-sc.yaml
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap             # EFS Access Point — an isolated dir per claim
+  fileSystemId: fs-05ce26454cd884a57   # the EFS filesystem to carve up
+  directoryPerms: "700"
+  basePath: "/roboshop"                # optional — where the sub-directories live
+```
+
+The mental model differs from EBS in an important way:
+
+> **EBS dynamic creates a new disk per claim. EFS dynamic does *not* create a new filesystem** — it creates an **access point**, a permission-scoped sub-directory inside the *one* EFS filesystem you already made. That's why the StorageClass needs an existing `fileSystemId`.
+
+```yaml
+# k8-resources/volumes/08-efs-dynamic.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-dynamic
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efs-dynamic
+spec:
+  containers:
+    - name: nginx
+      image: nginx
+      volumeMounts:
+        - name: persistent-storage
+          mountPath: /data
+  volumes:
+    - name: persistent-storage
+      persistentVolumeClaim:
+        claimName: efs-dynamic
+```
+
+### The rule to remember
+
+> **EBS for databases. EFS for file storage.**
+
+EFS is a network filesystem — the latency and file-locking behaviour that make it great for shared files make it wrong for a database's data directory. If someone asks "can I run MySQL on EFS?", the answer is *don't*.
+
+---
+
+## Toward StatefulSet — Why Deployments Aren't Enough
+
+*(Started this session, covered properly next session.)*
+
+Think concretely about running **MySQL in Kubernetes** with more than one replica. Three requirements appear, and a Deployment satisfies **none** of them:
+
+1. **Each pod needs its own storage.** Two database pods writing the same disk corrupts it — every replica needs a separate volume.
+2. **Pods must be discoverable by their peers.** A write landing on one pod has to be replicated to the others, so each pod needs a **stable, addressable identity** — not a random name and a new IP each restart.
+3. **A restarted pod must reattach to *its own* volume.** If pod-0 dies and comes back, it must find the exact disk it had before, not a fresh one.
+
+That's the whole problem. A **Deployment** is built for **stateless** apps, where every replica is interchangeable and they can all share one volume. For **stateful** apps, Kubernetes provides a different controller — the **StatefulSet**.
+
+### Deployment vs StatefulSet
+
+| | **Deployment** | **StatefulSet** |
+|---|---|---|
+| Built for | **Stateless** applications | **Stateful** applications |
+| Storage | All replicas share the **same** volume | **Each pod gets its own** volume |
+| Pod identity | Random suffix (`frontend-7d9f8b-xk2p9`), interchangeable | Stable ordinal (`mysql-0`, `mysql-1`), sticky |
+| On restart | Any pod, any volume | The **same pod name reattaches to the same volume** |
+
+This closes a loop opened right back at the start of the Docker notes: *stateless apps are easy to containerise, stateful ones need special care.* StatefulSet is the shape that care takes in Kubernetes.
 
 ---
 
@@ -1023,8 +1247,21 @@ Compare it to the Compose file from the Docker sessions and it's the same applic
 | EBS static gotchas | CSI driver + node IAM (`EBSCSIDriverPolicy`) + same-AZ disk + `nodeSelector` |
 | `storageClassName: ""` | Bind to my named PV; do **not** fall back to the default StorageClass |
 | **Access modes** | RWO (1 node) / ROX (many RO) / RWX (many RW → EFS) / RWOncePod (1 pod) |
-| **Reclaim policy** | Delete (disk destroyed) / **Retain** (data survives) / Recycle (wiped, deprecated) |
+| **Reclaim policy** | Delete (data+disk gone) / **Retain** (data+disk kept) / Recycle (data wiped, disk kept) |
 | Scheduler | Picks the node; steer it with `nodeSelector`/affinity — needed for AZ-locked EBS |
+| **StorageClass** | Recipe that provisions the disk **and** its PV automatically; one per storage type |
+| Dynamic vs static | PVC → SC makes the disk on demand / you pre-create the disk **and** the PV |
+| Dynamic analogy | son → mother → **PhonePe wallet** — money on demand, no physical wallet |
+| `provisioner` | Who creates the disk — `ebs.csi.aws.com` / `efs.csi.aws.com` |
+| **`WaitForFirstConsumer`** | Create the disk **after** the pod is scheduled → lands in the node's AZ (no `nodeSelector`) |
+| `Immediate` binding | Disk made before any pod exists → can land in the wrong AZ → pod stuck `Pending` |
+| EFS setup gotcha | Allow **port 2049 (NFS)** in the EFS security group or mounts hang |
+| EFS `capacity:` | **Dummy value** — API requires it, but EFS grows automatically |
+| EFS dynamic | Creates an **access point** (sub-dir) in an existing filesystem, not a new EFS |
+| `provisioningMode: efs-ap` | EFS Access Point mode; needs an existing `fileSystemId` |
+| **EBS vs EFS rule** | **EBS for databases, EFS for file storage** — never a DB on EFS |
+| Why MySQL needs StatefulSet | Own volume per pod + stable discoverable identity + reattach to the same disk |
+| **Deployment vs StatefulSet** | Stateless, shared volume, random names / stateful, volume per pod, sticky `mysql-0` |
 | **startupProbe** | Has it booted? Runs **once**; buys slow starters time |
 | **readinessProbe** | Ready for traffic? Fails → **removed from Service endpoints** (no restart) |
 | **livenessProbe** | Still alive? Fails → **pod restarted** |
