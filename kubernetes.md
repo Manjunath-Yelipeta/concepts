@@ -1194,6 +1194,8 @@ A common interview question: **what is a headless service, and why does a Statef
 **A Service with `clusterIP: None` is a headless service.** The difference is entirely in what DNS returns:
 you can check the nslookup by installing dns utils . cat /etc/*release -> if debian -> apt install dns utils -> nslookup svc
 
+-> you can check the nslookup by installing dns utils . cat /etc/*release -> if debian -> apt install dns utils -> nslookup svc
+
 | | **Normal Service** | **Headless Service** (`clusterIP: None`) |
 |---|---|---|
 | `nslookup <svc-name>` returns | **One** IP — the service's ClusterIP | **All the endpoints** (every pod IP) behind it |
