@@ -1367,6 +1367,8 @@ How to read it: *"keep `catalogue` between 1 and 10 pods, adding replicas whenev
 
 > Note the HPA targets a **Deployment** — stateless services are the ones you autoscale. You generally don't autoscale a database StatefulSet; adding a replica there means joining a cluster and replicating data, which isn't something a CPU threshold should trigger.
 
+ -> to see hpa in action do this install apache benchmarker ab and give the concurrent traffic " ab -k -n 20000 -c 200 -s 120 http://af908324d483140cabee343998ba9118-1347454829.us-east-1.elb.amazonaws.com/ " and see the autoscaling part by setting averageUtilization: 10.
+
 ### Controlling *where* pods land
 
 Scaling decides **how many** pods; a separate family of settings decides **which node** each one goes to. Three mechanisms, worth knowing by name:
