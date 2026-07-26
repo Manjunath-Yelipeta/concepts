@@ -1390,7 +1390,7 @@ The distinction that sticks: **taints are the node pushing pods away; affinity i
 3. since hard rule we have taints . taint a node with (kubectl taint nodes ip project=roboshop:strategy(NoExecute, NoSchedule) and tolerance at pod level. but toleration is not guaranteed always.
 4. to guarantee toleration we need to have toleration and node selector at pod level.
 5. since nodeselector is  hard rules we need to have multiple options so came node affinity .(required -> hard rule, preferred -> soft rule) defined at affinity in a pod at spec level.
-6. understand node affinity at set level with required  and how weightage happens with preferred, we need to manually see how these applies with examples in github.
+6. understand node affinity at set theory with required  and how weightage happens with preferred, we need to manually see how these applies with examples in github.
 7. node anti affinity with operator NotIn.
 8. pod affinity for related database and backend to decrese latency. pod anti affinity between differen database services at pod level
 9. understand usecase from kubernetes documentation with webservers and cache.
