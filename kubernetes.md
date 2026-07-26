@@ -1383,6 +1383,20 @@ The distinction that sticks: **taints are the node pushing pods away; affinity i
 
 *(`nodeSelector` — used earlier to pin a pod to the EBS volume's AZ — is the simplest member of this family.)*
 
+### how to experience controlling of pods.(my notes)
+1. get the values of running node in cluster (kubectl get odes --show-labels)
+2. labelled the node (kubectl label nodes ip project=roboshop) and at pod level nodeSelector with project: roboshop -> it guarantess pod to
+ node but its hard rule.
+3. since hard rule we have taints . taint a node with (kubectl taint nodes ip project=roboshop:strategy(NoExecute, NoSchedule) and tolerance at pod level. but toleration is not guaranteed always.
+4. to guarantee toleration we need to have toleration and node selector at pod level.
+5. since nodeselector is  hard rules we need to have multiple options so came node affinity .(required -> hard rule, preferred -> soft rule) defined at affinity in a pod at spec level.
+6. understand node affinity at set level with required  and how weightage happens with preferred, we need to manually see how these applies with examples in github.
+7. node anti affinity with operator NotIn.
+8. pod affinity for related database and backend to decrese latency. pod anti affinity between differen database services at pod level
+9. understand usecase from kubernetes documentation with webservers and cache.
+10. refer the examples here https://github.com/Manjunath-Yelipeta/k8-selector.git
+
+
 ### k9s
 
 A terminal UI for the cluster — far faster than typing `kubectl get`/`describe` repeatedly when you're watching pods roll or debugging a StatefulSet come up:
