@@ -1384,7 +1384,7 @@ The distinction that sticks: **taints are the node pushing pods away; affinity i
 *(`nodeSelector` — used earlier to pin a pod to the EBS volume's AZ — is the simplest member of this family.)*
 
 ### how to experience controlling of pods.(my notes)
-1. get the values of running node in cluster (kubectl get odes --show-labels)
+1. get the values of running node in cluster (kubectl get nodes --show-labels)
 2. labelled the node (kubectl label nodes ip project=roboshop) and at pod level nodeSelector with project: roboshop -> it guarantess pod to
  node but its hard rule.
 3. since hard rule we have taints . taint a node with (kubectl taint nodes ip project=roboshop:strategy(NoExecute, NoSchedule) and tolerance at pod level. but toleration is not guaranteed always.
