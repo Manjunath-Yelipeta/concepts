@@ -1613,6 +1613,14 @@ helm install prometheus-stack prometheus-community/kube-prometheus-stack \
 So Helm is where the course's two threads meet: your own roboshop services become parameterised charts, and the platform pieces you depend on (CSI drivers, Prometheus) arrive as someone else's charts — both installed the same way.
 
 
+### how to experience helm charts in roboshop
+1. say for mongodb , first divide the manifest to statefulset.yaml, service.yaml and identify the frequently changing ones and keep the placeholders for that.
+2. have a values.yaml thats supplies values for them.
+3. do helm upgrade --install mongodb --description="installing 4.0.0 version" -> helm list in namespace roboshop -> kubectl get pods -> see they are in pending.
+4. see above to add the public charts of aws-ebs-csi-driver and install that using helm.
+5. then apply mongodb/04_ebs_sc.yaml to provide the dynamic provisioning of pv and ebs volume. you can see the pod coming to running state.
+
+
 
 ### k9s
 
