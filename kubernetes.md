@@ -428,7 +428,7 @@ The default. Internal only — perfect for backend services and databases that s
 
 #### How I tested Clusterip is
 1. I ran the 04labels-demo manifest and the 13_services.yaml manifest files.
-2. exec to labels-demo pod and the did curl http://nginx-service:80 and go the response where I concluded clusterip is for internal communication between pods
+2. exec to labels-demo pod and the did curl http://nginx-service:80 and got the response where I concluded clusterip is for internal communication between pods
 
 #### NodePort
 
@@ -464,6 +464,10 @@ spec:
 ```
 
 Each type builds on the one before: **LoadBalancer → NodePort → ClusterIP → pod**. In roboshop only `frontend` is a LoadBalancer; everything behind it is ClusterIP.
+
+#### How I confirmed working of loadbalancer 
+1. I ran the 04labels-demo manifest and the 14_loadbalancer.yaml manifest files.
+2. exec to labels-demo pod and the did curl http://loadbalanerdns:80 and got the response where I concluded clusterip is for internal communication between pod. we get the loadbalanerdns from describing the service.
 
 ---
 
