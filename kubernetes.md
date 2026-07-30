@@ -1711,6 +1711,14 @@ aws secretsmanager get-secret-value --secret-id roboshop/dev/mysql_root_password
 
 That is the whole point of IRSA: **no long-lived AWS access keys in the pod, no secrets in the image** — just an identity that AWS trusts, scoped to exactly the permissions the pod needs.
 
+
+#### How to experience service accounts by self.
+1. to experience default service account , create a namesape (kubectl create namespace roboshop), kubens roboshop, kubectl get sa or k9(pod) we can see service account.
+2. create a policy and attach arn of secret and get the arn of the policy
+3. modify attach-policy-arn with the policy arn while creating service account with the command.
+4. to check exec to pod , run aws secretsmanager get-secret-value --secret-id secret_name without serviceAccountName: roboshop-secret-reader
+we cant access. with serviceAccountName: roboshop-secret-reader we can access the secret. refer 06_pod.yaml in my repo k8-rbac.
+
 ---
 
 ## Ingress — One Load Balancer, Many Services
