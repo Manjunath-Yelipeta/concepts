@@ -1795,6 +1795,10 @@ Note where the configuration lives: everything ALB-specific is an **annotation**
 
 The one annotation worth calling out is **`group.name: roboshop`**. Both `app-1` and `app-2` carry the same group name, so the controller puts **both** Ingresses behind a **single shared ALB** instead of one per app — the same cost lesson as before, now solved: one load balancer, many services, routed by hostname.
 
+#### what we did to experience.
+1. created a certificate with *.aiops26.online and validated it. added r53 records with load balancer arn.
+2. pls refer to  the repo k8-ingress but we need to follow the readme of the repo to set up the load balance controller with the service account.
+
 
 ---
 
