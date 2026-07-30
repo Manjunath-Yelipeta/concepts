@@ -426,6 +426,10 @@ This is why roboshop's nginx config can say `proxy_pass http://catalogue:8080/` 
 
 The default. Internal only — perfect for backend services and databases that should never be publicly reachable. Every roboshop backend (`catalogue`, `user`, `cart`, `mongodb`, `mysql`) uses it.
 
+#### How I tested Clusterip is
+1. I ran the 04labels-demo manifest and the 13_services.yaml manifest files.
+2. exec to labels-demo pod and the did curl http://nginx-service:80 and go the response where I concluded clusterip is for internal communication between pods
+
 #### NodePort
 
 Exposes the pod to the outside world:
