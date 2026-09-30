@@ -184,6 +184,8 @@ spec:
 
 Note `command:` — that's the Kubernetes way to override a container's `CMD`, same idea as passing a command to `docker run`.
 
+illustration to see that containers in same pod will share same network and storage. we logged to almalinux with kubectl exec -it multi-container -c almalinux -- bash and did curl http://localhost to see that the nginx is responding.
+
 ### Debugging pods
 
 Two failure states you'll hit constantly, and what they actually mean:
@@ -513,7 +515,10 @@ spec:
         image: nginx:trixie-otel
 ```
 
-**The catch:** a ReplicaSet **does not care about image version changes**. Change the image and nothing happens — it sees N pods running and is satisfied. That limitation is the entire reason Deployments exist.
+**The catch:** a ReplicaSet **does not care about image  version changes**. Change the image and nothing happens — it sees N pods running and is satisfied. That limitation is the entire reason Deployments exist.
+
+illustration for replicaset is we created 10 pods and deleted one among that using kubectl delete pod <podname> but replica set make sures onother pod gets created.
+also observed that when we change the image version in the yaml the running pods are not getting affected only when we delete one pod the newly created specific pod get the latest image. also the pod naming convention starts with the name of the replica set.
 
 ### Deployment
 
@@ -589,6 +594,7 @@ kubectl rollout undo deployment/frontend -n roboshop      # back to the previous
 This is where `latest` bites you again: rolling back means pointing at a *specific* previous version. If everything is `latest`, there's nothing to roll back **to** — which is why roboshop pins `joindevops/catalogue:4.0.0`.
 
 ---
+illustration for deployment is when we change the image version with running pods , we were able to observe the rolling update with the new replica set and the new pods being created. also the naming convention observed is deployment -> replicaset -> pod.
 
 ## ConfigMaps as Files, and Volumes
 
